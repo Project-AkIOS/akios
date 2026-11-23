@@ -295,7 +295,7 @@ lower_draw_sysvals(nir_builder *b, nir_intrinsic_instr *in, void *data)
 
 		/* (a half-float format is told only for a target whose blend is computed in the shader: its tile holds
 		 * the floats) */
-		value = nir_imm_int(b, format == 55 ? (167 << 12 | 16) : format == 25 ? 199 << 12 : format == 65 ? 207 << 12 :
+		value = nir_imm_int(b, format == 55 ? (167 << 12 | 16) : format == 105 ? (175 << 12 | 16) : format == 63 ? (140 << 12 | 16) : format == 25 ? 199 << 12 : format == 65 ? 207 << 12 :
 		    format == 115 ? 223 << 12 : format == 92 ? 89 << 12 : format == 71 || format == 81 ? (237 << 12 | 1 << 20) :
 		    237 << 12);
 		break;
@@ -697,6 +697,7 @@ lower_shader_blend(nir_shader *s, const struct mali_shader_blend *blend, struct 
 		const struct mali_blend_rt *m = i < 4 ? &blend->rt[i] : NULL;
 
 		rt->format = blend->format[i < 4 ? i : 0] == 55 && i < 4 ? PIPE_FORMAT_R32_FLOAT :
+		    i < 4 && blend->format[i] == 105 ? PIPE_FORMAT_R32G32_FLOAT :
 		    i < 4 && blend->format[i] == 25 ? PIPE_FORMAT_R16_FLOAT :
 		    i < 4 && blend->format[i] == 65 ? PIPE_FORMAT_R16G16_FLOAT :
 		    i < 4 && blend->format[i] == 115 ? PIPE_FORMAT_R16G16B16A16_FLOAT :
@@ -731,6 +732,26 @@ mali_boot_arg(const char *word)
 #else
 	(void)word;
 	return 0;               /* (the host's compile: tools/mesa/pan/mali_stage_host) */
+#endif
+}
+
+/* a number in the boot-args, "KEY=N" (the phone's; DEFAULT when absent, and on the host) */
+static unsigned
+mali_boot_number(const char *key, unsigned dflt)
+{
+#ifdef __APPLE__
+	char args[1024] = { 0 };
+	size_t size = sizeof(args) - 1;
+	const char *at;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (at = strstr(args, key)) == NULL ||
+	    at[strlen(key)] != '=') {
+		return dflt;
+	}
+	return (unsigned)strtoul(at + strlen(key) + 1, NULL, 10);
+#else
+	(void)key;
+	return dflt;
 #endif
 }
 
@@ -844,6 +865,7 @@ static int
 compile_nir(nir_shader *s, mesa_shader_stage want, const void *vs_varyings, struct mali_kernel_binary *out, char *error,
     size_t error_size)
 {
+	unsigned big_blocks = 0, big_instrs = 0;      /* (the size check below; the timing line) */
 	struct pan_compile_inputs inputs = { .gpu_id = GPU_ID, .fau = { .reserved = MALI_KERNEL_RESERVED } };
 	struct pan_varying_layout *varyings = NULL;
 	struct pan_shader_info info;
@@ -954,11 +976,52 @@ compile_nir(nir_shader *s, mesa_shader_stage want, const void *vs_varyings, stru
 		say(error, error_size, "%s: %s", out->name, why);
 		goto done;
 	}
+	{
+		/*
+		 * TOO BIG FOR THE BACK END YET (11-23): Mesa's SSA spiller has passes that grow with the square of the blocks
+		 * (find_all_dominated_predecessors, bi_repair_ssa, for every loop header): backboardd's compositor uber shaders
+		 * (VfxXgh + A3Xghfc, once their inline samplers compiled) kept it busy for minutes, backboardd never answered
+		 * SpringBoard. A shader over mali_maxblocks (default 1000; 0: no limit) is refused by name with its size -- the
+		 * stand-in's draws skipped, as before those pipelines compiled at all -- until the spiller is made faster.
+		 */
+		static unsigned max_blocks = ~0u;
+		unsigned blocks = 0, instrs = 0;
+
+		if (max_blocks == ~0u) {
+			max_blocks = mali_boot_number("mali_maxblocks", 1000);   /* (11-23: 300 refused Setup's globe, 510 blocks; CA's giants are ~3600) */
+		}
+		nir_foreach_function_impl(impl, s) {
+			nir_foreach_block(block, impl) {
+				blocks++;
+				nir_foreach_instr(instr, block) {
+					instrs++;
+				}
+			}
+		}
+		if (max_blocks != 0 && blocks > max_blocks) {
+			say(error, error_size, "%s: %u blocks, %u instructions: too big for the Mali back end's spiller yet "
+			    "(mali_maxblocks=%u)", out->name, blocks, instrs, max_blocks);
+			goto done;
+		}
+		big_blocks = blocks;
+		big_instrs = instrs;
+	}
+	struct timespec t0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
 	if (getenv("MALI_COMPILE_NIR") != NULL) {
 		nir_print_shader(s, stderr);            /* (host debugging: the NIR the back end is given) */
 	}
 	binary = UTIL_DYNARRAY_INIT;
 	pan_shader_compile(s, &inputs, &binary, &info);
+	{
+		/* (11-23) how long the back end took for a big one: stderr, which OSLOG puts on the console for a job */
+		struct timespec t1;
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		double secs = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+		if (big_blocks > 100 || secs > 1.0) {
+			fprintf(stderr, "mali compile: %s: %u blocks, %u instructions: %.1f s\n", out->name, big_blocks, big_instrs, secs);
+		}
+	}
 	if (binary.size == 0) {
 		util_dynarray_fini(&binary);
 		say(error, error_size, "%s: the panfrost compiler gave no code", out->name);

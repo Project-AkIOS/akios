@@ -913,14 +913,15 @@ const MaliFormat kFormats[] = {
 // blend descriptors' and LD_TILE's conversion), converted at write-back. Metal names packed formats from the low bits:
 // BGRA8, BGR5A1 and B5G6R5 all have blue first, hence the swizzle.
 constexpr uint32_t kRtFloat = 1u << 30;       // (not the descriptor's: a float target, see below)
-constexpr uint32_t kRtRaw = 1u << 29;         // (not the descriptor's: a raw 32-bit target, R32Float)
+constexpr uint32_t kRtRaw = 1u << 29;         // (not the descriptor's: a raw target, R32Float; with kRtWide RG32Float)
 constexpr uint32_t kRtWide = 1u << 28;        // (not the descriptor's: 8 bytes a pixel in the tile buffer, RGBA16Float)
-constexpr uint32_t kRtOurs = kRtFloat | kRtRaw | kRtWide;
+constexpr uint32_t kRtInt = 1u << 27;         // (not the descriptor's: an integer raw target, RG16Uint)
+constexpr uint32_t kRtOurs = kRtFloat | kRtRaw | kRtWide | kRtInt;
 bool
 rtFormat(unsigned f, uint32_t &rt1)
 {
     uint32_t wb;
-    bool bgra, srgb = f == 71 || f == 81, flt = false, raw = false, wide = false;
+    bool bgra, srgb = f == 71 || f == 81, flt = false, raw = false, wide = false, integer = false;
     switch (f) {
     case 70: case 71: wb = 19; bgra = false; break;     // R8G8B8A8
     case 80: case 81: wb = 19; bgra = true; break;
@@ -940,6 +941,15 @@ rtFormat(unsigned f, uint32_t &rt1)
     // own -- raw, 32 bits as they are (internal RAW32, written back as RAW32; Mesa's get_rt_formats for a format that
     // is not blendable). Opaque writes only: the fixed-function blend does not know such a target.
     case 55: wb = 3; bgra = false; raw = true; break;
+    // RG32Float (11-23: what iOS 27's vector paths -- Setup's text and shapes, path_exterior/path_interior, plane+spill --
+    // draw their second colour attachment into): raw as R32Float, 64 bits a pixel -- internal RAW64 (35), written back as
+    // RAW64 (5), eight bytes in the tile buffer like RGBA16Float (kRtWide: two kilobytes), its clear red's and green's
+    // floats as they are (rtClear, rtClearHigh); opaque writes only, blending in the shader (rawBlend)
+    case 105: wb = 5; bgra = false; raw = true; wide = true; break;
+    // RG16Uint (11-23: iOS 27's glass "brim" passes in backboardd, brim_init_lph and its clears): raw as R32Float, 32
+    // bits a pixel, the blend descriptor's memory format RG16UI (rtBlend) so the hardware packs the shader's two
+    // integers; its clear the two 16-bit integers (rtClear). Integer targets do not blend.
+    case 63: wb = 3; bgra = false; raw = true; integer = true; break;
     // RGBA16Float (11-13: HDR and wide-colour content): the tile buffer's RGBA16F (internal format 18, written back as
     // the float colour format 19), EIGHT bytes a pixel -- two of the tile's kilobytes (rtKilobytes: the targets after it
     // start further on, the framebuffer's allocation counts it), its clear two words (rtClearHigh)
@@ -952,7 +962,7 @@ rtFormat(unsigned f, uint32_t &rt1)
     }
     uint32_t swizzle = bgra ? (2 | 1 << 3 | 0 << 6 | 3 << 9) : (0 | 1 << 3 | 2 << 6 | 3 << 9);
     rt1 = wb << 3 | 2u << 8 | (srgb ? 1u << 14 : 0) | swizzle << 16 | (flt ? kRtFloat : 0u) | (raw ? kRtRaw : 0u) |
-        (wide ? kRtWide : 0u);
+        (wide ? kRtWide : 0u) | (integer ? kRtInt : 0u);
     return true;
 }
 // the render target's internal format (word 0, bits 26..), the blend descriptor's memory format, and a clear colour
@@ -965,12 +975,13 @@ rtFormat(unsigned f, uint32_t &rt1)
 // backdrop capture is a BGR5A1 one: the blurred sheet too dark, and a black box where a frame redrew a part of it only.
 inline bool rt5551(uint32_t rt1) { return !(rt1 & kRtOurs) && ((rt1 >> 3) & 31) == 28; }
 inline bool rt565(uint32_t rt1) { return !(rt1 & kRtOurs) && ((rt1 >> 3) & 31) == 21; }
-inline uint32_t rtInternal(uint32_t rt1) { return (rt1 & kRtRaw) ? 34 : (rt1 & kRtWide) ? 18 : (rt1 & kRtFloat) ? (rt1 >> 3) & 31 : rt5551(rt1) ? 6 : rt565(rt1) ? 5 : 1; }
+inline uint32_t rtInternal(uint32_t rt1) { return (rt1 & kRtRaw) ? ((rt1 & kRtWide) ? 35u : 34u) : (rt1 & kRtWide) ? 18 : (rt1 & kRtFloat) ? (rt1 >> 3) & 31 : rt5551(rt1) ? 6 : rt565(rt1) ? 5 : 1; }
 inline uint32_t rtKilobytes(uint32_t rt1) { return (rt1 & kRtWide) ? 2 : 1; }   // of the tile buffer, a 16x16 tile (or 8x8 of 4 samples)
 inline uint32_t
 rtBlend(uint32_t rt1)
 {
-    if (rt1 & kRtRaw) return 167u << 12 | 16;                   // R32F, as a texture of it is named
+    if ((rt1 & kRtRaw) && (rt1 & kRtInt)) return 140u << 12 | 16;               // RG16UI, as a texture of it is named
+    if (rt1 & kRtRaw) return (rt1 & kRtWide) ? (175u << 12 | 16) : (167u << 12 | 16);   // RG32F, R32F: as a texture of it is named
     if (rt1 & kRtWide) return 223u << 12;                       // RGBA16F
     if ((rt1 & kRtFloat) && ((rt1 >> 3) & 31) == 20) return 89u << 12;      // R11F_G11F_B10F
     // (11-13) AN sRGB TARGET's memory format says so (bit 20, as a texture of it does): without it the blend unit wrote
@@ -997,6 +1008,10 @@ uint8_t unorm8(double v);
 inline uint32_t
 rtClear(uint32_t rt1, const double *k)
 {
+    if ((rt1 & kRtRaw) && (rt1 & kRtInt)) {
+        auto u16 = [](double v) { return v <= 0 ? 0u : v >= 65535 ? 65535u : (uint32_t)v; };
+        return u16(k[0]) | u16(k[1]) << 16;                     // RG16Uint: red and green as integers
+    }
     if (rt1 & kRtRaw) {
         float f = (float)k[0];
         uint32_t bits;
@@ -1038,6 +1053,12 @@ rtClear(uint32_t rt1, const double *k)
 inline uint32_t
 rtClearHigh(uint32_t rt1, const double *k)
 {
+    if ((rt1 & kRtRaw) && (rt1 & kRtWide)) {
+        float f = (float)k[1];                                  // RG32Float: green's float (red's: rtClear)
+        uint32_t bits;
+        memcpy(&bits, &f, 4);
+        return bits;
+    }
     return (rt1 & kRtWide) ? halfOf(k[2]) | halfOf(k[3]) << 16 : rtClear(rt1, k);
 }
 bool drawable(unsigned f) { uint32_t w; return rtFormat(f, w); }
@@ -2095,6 +2116,40 @@ struct hakios_metal_queue {
                     // (HakiosGPU's: the queue was restarted after a GPU fault with this submission not done)
                     cb->error = "a GPU fault: the command buffer's work is lost (the queue was restarted)";
                     cb->status = HAKIOS_METAL_ERROR;
+                    // (11-23) what the lost command buffer read: each draw's program, its target, its textures' memory and
+                    // the 64-bit push constants that look like GPU addresses -- to find the draw of a fault's address
+                    // (the kernel's "page fault ... at") among them. The first 6 faulting command buffers of a process.
+                    static int said_faults;
+                    if (said_faults++ < 6) {
+                        for (size_t di = 0; di < cb->draws.size() && di < 24; di++) {
+                            const DrawJob &x = cb->draws[di];
+                            std::string line;
+                            char one[128];
+                            snprintf(one, sizeof(one), "fault cb draw %zu: %s target 0x%llx", di, x.name ? x.name : "?",
+                                (unsigned long long)x.target_va);
+                            line += one;
+                            for (unsigned t = 0; t < x.texture_count; t++) {
+                                if (x.textures[t]) {
+                                    snprintf(one, sizeof(one), " T%u[0x%llx+%llu %ux%u]", t,
+                                        (unsigned long long)(x.textures[t]->bo.va + x.textures[t]->offset),
+                                        (unsigned long long)x.textures[t]->bo.size, x.textures[t]->width, x.textures[t]->height);
+                                    line += one;
+                                }
+                            }
+                            const std::vector<uint32_t> *faus[2] = { &x.vs_fau, &x.fs_fau };
+                            for (int st = 0; st < 2; st++) {
+                                const std::vector<uint32_t> &f = *faus[st];
+                                for (size_t w = 0; w + 1 < f.size(); w += 2) {
+                                    uint64_t v = f[w] | (uint64_t)f[w + 1] << 32;
+                                    if (v >= 0x100000000ULL && v < 0x10000000000ULL) {
+                                        snprintf(one, sizeof(one), " %s%zu=0x%llx", st ? "f" : "v", w / 2, (unsigned long long)v);
+                                        line += one;
+                                    }
+                                }
+                            }
+                            fprintf(stderr, "HakiosMetal: %s\n", line.c_str());
+                        }
+                    }
                 } else {
                     cb->status = HAKIOS_METAL_COMPLETED;
                 }
@@ -4238,7 +4293,7 @@ seedDir()
     static std::string dir;
     static std::once_flag once;
     std::call_once(once, [] {
-        const char *d = "/redwood/share/hakios-metal-cache-mali";
+        const char *d = "/akita/share/hakios-metal-cache-mali";      // (11-23: was /redwood, missed by the rename)
         struct stat st;
         if (!bootArg("metal_seed=0") && stat(d, &st) == 0 && S_ISDIR(st.st_mode)) {
             dir = d;
@@ -4248,6 +4303,49 @@ seedDir()
 }
 
 // both stages from the file KEY names; false (and nothing left allocated) when there is none or it is not whole
+// REFUSALS KEPT TOO (11-23): CoreAnimation's uber pipelines (VfxXgh + A3Xghfc, 3598 blocks) go through seconds of NIR
+// passes before compile_mali.c refuses them for their size -- and a refusal was never cached, so every boot did that
+// again for all of them: SpringBoard waited ~85 s for backboardd's warmup_shaders. A size refusal depends only on what the
+// key covers and the limit (kept in the file and checked), so it is remembered as KEY.refused; no other refusal is (a fix
+// of the plug-in may lift it).
+static const char kTooBig[] = "too big for the Mali back end's spiller yet";
+bool
+refusalLoad(uint64_t key, char *why, size_t why_size)
+{
+    if (!cacheOn() || cacheDir().empty()) return false;
+    int fd = open((cachePath(key) + ".refused").c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    char text[512] = {};
+    ssize_t n = read(fd, text, sizeof(text) - 1);
+    close(fd);
+    if (n <= 0 || strstr(text, kTooBig) == nullptr) return false;
+    // (only under the same limit: a refusal remembered under mali_maxblocks=300 must not outlive a raised limit)
+    char limit[48];
+    unsigned max_blocks = 1000;
+    {
+        char args[1024] = {};
+        size_t an = sizeof(args) - 1;
+        const char *at = nullptr;
+        if (sysctlbyname("kern.bootargs", args, &an, nullptr, 0) == 0 && (at = strstr(args, "mali_maxblocks=")) != nullptr)
+            max_blocks = (unsigned)strtoul(at + 15, nullptr, 10);
+    }
+    snprintf(limit, sizeof(limit), "(mali_maxblocks=%u)", max_blocks);
+    if (strstr(text, limit) == nullptr) return false;
+    snprintf(why, why_size, "%s (remembered)", text);
+    return true;
+}
+void
+refusalStore(uint64_t key, const char *why)
+{
+    if (!cacheOn() || cacheDir().empty() || strstr(why, kTooBig) == nullptr) return;
+    std::string path = cachePath(key) + ".refused", tmp = path + "." + std::to_string(getpid()) + ".tmp";
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    bool ok = write(fd, why, strlen(why)) == (ssize_t)strlen(why);
+    close(fd);
+    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) unlink(tmp.c_str());
+}
+
 bool
 cacheLoad(uint64_t key, mali_kernel_binary *vs, mali_kernel_binary *fs)
 {
@@ -4356,10 +4454,16 @@ hakios_metal_program_new_bitcode_constants(const void *vs_bitcode, size_t vs_siz
                 found ? p->vs.size : 0, found ? p->fs.size : 0);
         }
     }
+    if (!found && refusalLoad(key, why, sizeof(why))) {
+        fail("%s", why);
+        p->release();
+        return nullptr;
+    }
     if (!found) {
         if (mali_stage_compile(vs_bitcode, vs_size, vc.data(), vs_count, 0, nullptr, &p->vs, why, sizeof(why)) != 0 ||
             (depth_only ? mali_depth_only_fragment_compile(&p->vs, &p->fs, why, sizeof(why))
                         : mali_stage_compile(fs_bitcode, fs_size, fc.data(), fs_count, 1, &p->vs, &p->fs, why, sizeof(why))) != 0) {
+            refusalStore(key, why);
             fail("%s", why);
             p->release();
             return nullptr;
@@ -4519,6 +4623,11 @@ compileFetch(hakios_metal_program *p)
     std::lock_guard<std::mutex> g(p->lock);
     bool blended = p->shader_blend.mask != 0 || p->shader_blend.format[0] || p->shader_blend.format[1] ||
         p->shader_blend.format[2] || p->shader_blend.format[3];   // (a float target's format: the fetch's conversion)
+    // (11-23) a program without a fragment function (depth or stencil only, hakios_depth_only_fs) writes no colour: its
+    // targets' formats do not matter -- iOS 27's path_edges_vertex draws, an RG32Float target in the pass, were refused
+    if (p->fs_bitcode.empty()) {
+        blended = false;
+    }
     if ((!p->fetch_described && !blended) || p->fetch_compiled) {
         return p->fetch_refusal.empty();
     }
@@ -4702,9 +4811,9 @@ rawBlend(hakios_metal_program *p, unsigned i)
     // mask_accumulate draws left in an RG16Float attachment: every shape filled that way was missing (the News widget's
     // placeholders, "No events today" in Calendar's). Float attachments are the widgets' alone; metal_rtfmt=0: as before.
     static const bool told_always = !bootArg("metal_rtfmt=0");
-    p->shader_blend.format[i] = f == 55 || ((told_always || (p->shader_blend.mask & 1u << i)) && (f == 25 || f == 65 || f == 115 || f == 92)) ||
+    p->shader_blend.format[i] = f == 55 || f == 105 || f == 63 || ((told_always || (p->shader_blend.mask & 1u << i)) && (f == 25 || f == 65 || f == 115 || f == 92)) ||
         f == 71 || f == 81 ? f : 0;       // (an sRGB target's always: a framebuffer fetch from it must decode, 11-13)
-    if (f != 55 || !p->rt_blend_on[i]) {
+    if ((f != 55 && f != 105) || !p->rt_blend_on[i]) {
         return;
     }
     p->shader_blend.mask |= 1u << i;
@@ -6020,6 +6129,22 @@ hakios_metal_texture_new_iosurface(hakios_metal_device *d, unsigned surface_id, 
     unsigned width, unsigned height, unsigned usage)
 {
     const MaliFormat *f = findFormat(pixel_format);
+    // (11-23) BGR10_XR / BGR10_XR_sRGB (554/555) over a surface of 8-bit BGRA ('BGRA', 4 bytes a pixel): what the surface
+    // holds is BGRA8, and it is taken as that -- SpringBoard's lock-screen hello (the bookend: Setup's screen capture of
+    // backboardd's virtual framebuffer, which our compositor fills as BGRA8) asked it for every frame, ~500 refusals,
+    // "Failed to create BGRA texture: -6684" (kCVReturnPixelBufferNotMetalCompatible) and no animation
+    if (f == nullptr && plane == 0 && (pixel_format == 554 || pixel_format == 555)) {
+        Bo peek;
+        hakios_metal_device::SurfaceInfo pinfo;
+        if (d->surfaceBo(surface_id, peek, pinfo)) {
+            const bool bgra8 = pinfo.pixel_format == 0x42475241u;   // 'BGRA'
+            d->surfaceRelease(surface_id);
+            if (bgra8) {
+                pixel_format = pixel_format == 555 ? 81 : 80;       // BGRA8Unorm_sRGB, BGRA8Unorm
+                f = findFormat(pixel_format);
+            }
+        }
+    }
     if (f == nullptr || plane != 0) {
         fail("a texture over IOSurface %u of MTLPixelFormat %u, plane %u (not served on the Mali yet)", surface_id,
             pixel_format, plane);
@@ -7109,6 +7234,11 @@ hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitco
     // as compileFetch would at the first draw -- here, in the caller's background, and then not again
     bool blended = p->shader_blend.mask != 0 || p->shader_blend.format[0] || p->shader_blend.format[1] ||
         p->shader_blend.format[2] || p->shader_blend.format[3];   // (a float target's format: the fetch's conversion)
+    // (11-23) a program without a fragment function (depth or stencil only, hakios_depth_only_fs) writes no colour: its
+    // targets' formats do not matter -- iOS 27's path_edges_vertex draws, an RG32Float target in the pass, were refused
+    if (p->fs_bitcode.empty()) {
+        blended = false;
+    }
     mali_kernel_binary vs = {}, fs = {};
     char why[512] = "";
     uint64_t key = cacheKey(p->vs_bitcode.data(), p->vs_bitcode.size(), p->vs_constants, p->fs_bitcode.data(),
