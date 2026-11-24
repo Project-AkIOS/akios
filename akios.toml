@@ -11,6 +11,21 @@ legacy   = "~/akita/hakios-base"
 config   = "DEVELOPMENT"
 machine  = "BCM2837"                   # the slot our platform builds in
 version  = "25.6.0"                    # RC_DARWIN_KERNEL_VERSION
+# the drivers built in (one build option each); ak writes config/MASTER.hakios and bsd/dev/hakios.drivers.h from this
+drivers  = [
+  "guard", "bt_host", "battery", "ufs", "wifi_station",
+  "akita_aoc", "akita_amp", "akita_bt", "akita_torch", "akita_camera", "akita_display", "akita_gnss", "akita_mali",
+  "akita_haptic", "akita_keys", "akita_touch", "akita_modem", "akita_battery", "akita_acpm", "akita_thermal",
+  "akita_dvfs", "akita_rtc", "akita_power", "akita_mct", "akita_trusty", "akita_usb", "akita_wifi",
+]
+# what the kernel assumes when the boot line does not name an argument (pexpert/arm/pe_bootargs.c)
+default_args = [
+  "touchscreen=1", "buttons=1", "fuelgauge=1", "usbmux=1", "thermal=1", "dvfs=1", "mali_keep=1", "metal=1",
+  "metal_plugin=../../../akita/lib/HakiosMetal", "display_flip=1", "metal_all=1",
+  "root_apfs=ufs_ios_system", "var_hfs=ufs_ios_data", "cryptex_dev=ufs_ios_preboot",
+  "pcie=5", "pcie_delay=10", "wifi=8", "aoc=3", "amp=2", "speaker=1", "amp_gain=17", "aocrec=1", "fb_beat=0",
+  "cpuidle=1", "bt=2",
+]
 
 [phone]
 name     = "akita"

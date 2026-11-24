@@ -63,11 +63,30 @@ def kernel_env():
     return e
 
 
+def kernel_config():
+    """the kernel's driver configuration, from akios.toml [kernel]: config/MASTER.hakios (one build option a driver,
+    which the conf/files lists name) and bsd/dev/hakios.drivers.h (the list and the built-in default arguments)"""
+    k, x = CONF['kernel'], path('xnu')
+    drivers, defaults = k['drivers'], ' '.join(k['default_args'])
+    master = ['# made by ak from akios.toml [kernel] drivers: the drivers built in (not committed)', '#',
+              '#  HAKIOS_DRIVERS = [ %s ]' % ' '.join('hakios_' + d for d in drivers), '#']
+    master += ['options\t\tHAKIOS_%s\t# <hakios_%s>' % (d.upper(), d) for d in drivers]
+    header = ['/* made by ak from akios.toml [kernel] (not committed) */',
+              '#define HAKIOS_DRIVERS_LIST     "%s"' % ' '.join(drivers),
+              '#define HAKIOS_DRIVERS_COUNT    %d' % len(drivers),
+              '#define HAKIOS_DRIVERS_CONFIG   "akios.toml"',
+              '#define HAKIOS_DEFAULT_BOOTARGS "%s"' % defaults]
+    for f, lines in ((os.path.join(x, 'config', 'MASTER.hakios'), master), (os.path.join(x, 'bsd', 'dev', 'hakios.drivers.h'), header)):
+        text = '\n'.join(lines) + '\n'
+        if not os.path.exists(f) or open(f).read() != text:      # unchanged files keep their time: no needless rebuild
+            open(f, 'w').write(text)
+    say('drivers: %d built in (akios.toml)' % len(drivers))
+
+
 def cmd_kernel(a):
     log = os.path.join(rundir('kernel'), 'build.log')
     os.umask(0o022)
-    say('configuring the drivers (hakios-config.py kernel)')
-    sh(['python3', 'tools/hakios-config.py', 'kernel', '--tree', path('xnu')], log=log, cwd=LEGACY)
+    kernel_config()
     say('building XNU from', path('xnu'), '(log:', log + ')')
     k = os.path.join(path('xnu'), 'BUILD/obj/%s_ARM64_%s/mach.%s.%s' % (
         CONF['kernel']['config'], CONF['kernel']['machine'], CONF['kernel']['config'].lower(), CONF['kernel']['machine'].lower()))
