@@ -27,6 +27,25 @@ default_args = [
   "cpuidle=1", "bt=2",
 ]
 
+[userland]
+# `ak userland`: the repository (userland/userland.toml says what goes into out/akios.apfs) and what it is built with.
+# Its manifest names these as @key.
+repo         = "userland"
+toolchain    = "~/akita/hakios-base/xnu-deps/host/bin"      # xnu-clang, ld64, otool
+sdk_target   = "16.5"                                        # xnu-clang's -target iOS version (as xnu-env.sh sets it)
+sdk          = "~/theos/sdks/iPhoneOS27.2.sdk"
+arch         = "arm64e"
+ldid         = "~/theos/toolchain/linux/iphone/bin/ldid"
+ipsw         = "~/akita/hakios-base/sysimage-d16ap"         # the unpacked IPSW: rootfs/ (launchd jobs), var.skel, build.conf
+firmware     = "~/akita/hakios-base"                        # its fw-*/: the vendor's files, never in git
+ca_share     = "~/ca-share"                                  # QuartzCore's default.metallib (tools/ca-metallib.py)
+# (transition) still in the old tree: Metal (its own repository later) and the APFS tools
+metal        = "~/akita/hakios-base/hakios-metal"
+metal_plugin = "~/akita/hakios-base/userland/src"           # HakiosMetalCA.m, HakiosMetal.plist
+mkapfs       = "~/akita/hakios-base/tools/apfs/mkapfs.py"
+apfs_reader  = "~/akita/hakios-base/tools/apfs/apfs.py"
+carrierpack  = "~/akita/hakios-base/devices/akita/tools/mkcarrierpack.py"
+
 [phone]
 name     = "akita"
 # the command line every boot gets (the loader adds the device's own: devices/akita/soc.args)

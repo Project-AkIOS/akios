@@ -3,6 +3,8 @@
   ak kernel                 configure and build the kernel from xnu/ (out/kernel, out/kernel.full)
   ak firmware               build our EDK2 firmware (firmware/ inside .cache/mu-silicium) into out/firmware.img
   ak fwboot NAME            RAM-boot out/firmware.img, wait for the phone to come back to Android, keep its log
+  ak userland [--oslog L,..] build out/akios.apfs, the RAM disk the kernel starts from, out of userland/ (its
+                            userland.toml; --oslog: those launchd jobs log to the console)
   ak loader                 build the UEFI loader from loader/ (out/loader: AkiosBoot.efi, DarwinBoot.efi, Fat.efi)
   ak image [--flash] [--new-loader] [ARGS]
                             make a boot image from out/kernel and the current userland (out/test.img, or with
@@ -17,7 +19,7 @@ Every run's output goes to [paths] logs/<command>-<time>/.
 """
 import argparse, datetime, os, struct, subprocess, sys, time
 
-from . import adt, fat
+from . import adt, fat, userland
 
 try:
     import tomllib
@@ -105,6 +107,11 @@ def cmd_kernel(a):
     sh(['cp', '-p', k, stripped])
     sh([LEGACY + '/xnu-deps/host/bin/strip', '-x', stripped])
     say('kernel:', stripped, '(%d bytes)' % os.path.getsize(stripped))
+
+
+# ---- userland ---------------------------------------------------------------------------------------------------------
+def cmd_userland(a):
+    userland.run(ROOT, CONF, path, rundir, say, a)
 
 
 # ---- firmware ---------------------------------------------------------------------------------------------------------
@@ -418,6 +425,8 @@ def main():
     s = p.add_subparsers(dest='cmd', required=True)
     s.add_parser('kernel').set_defaults(f=cmd_kernel)
     s.add_parser('loader').set_defaults(f=cmd_loader)
+    u = s.add_parser('userland'); u.add_argument('--oslog', help='launchd labels (comma-separated) whose logs go to the console')
+    u.set_defaults(f=cmd_userland)
     s.add_parser('firmware').set_defaults(f=cmd_firmware)
     e = s.add_parser('esp'); e.add_argument('--quiet', action='store_true'); e.add_argument('--speaker', action='store_true')
     e.add_argument('--initrd', help='the RAM disk (default: the legacy tree\'s userland/root.apfs)')
