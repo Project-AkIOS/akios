@@ -4886,7 +4886,7 @@ hakios_metal_program_set_samples(hakios_metal_program *p, unsigned samples)
         fail("a sample count of %u", samples);
         return -1;
     }
-    p->samples = samples;
+    p->samples = samples == 2 ? 4 : samples;    // (11-24: 2 served as 4, as the textures are)
     return 0;
 }
 
@@ -6388,6 +6388,11 @@ hakios_metal_texture_new_multisample(hakios_metal_device *d, unsigned pixel_form
 {
     if (samples <= 1) {
         return hakios_metal_texture_new(d, 2, pixel_format, width, height, usage);
+    }
+    // (11-24) 2 samples are served as 4 (the Mali-G715 has no 2x pattern; Metal promises the resolved image, which 4 give
+    // at least as well): the lock-screen poster's depth attachment (MercuryPoster, Depth16Unorm x2) was refused
+    if (samples == 2) {
+        samples = 4;
     }
     if (samples != 4) {
         fail("a multisample texture of %u samples (the Mali-G715 has no 2x sample pattern -- Mesa serves it from v12; 4 is "
