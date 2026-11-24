@@ -1,7 +1,9 @@
 """ak: AkIOS's build, boot and flash tool.
 
   ak kernel                 configure and build the kernel from xnu/ (out/kernel, out/kernel.full)
-  ak image [--flash] [ARGS] make a boot image from out/kernel and the current userland (out/test.img, or with
+  ak loader                 build the UEFI loader from loader/ (out/loader: AkiosBoot.efi, DarwinBoot.efi, Fat.efi)
+  ak image [--flash] [--new-loader] [ARGS]
+                            make a boot image from out/kernel and the current userland (out/test.img, or with
                             --flash out/flash.img: no kill switches); ARGS are extra boot arguments
   ak boot NAME [ARGS]       RAM-boot out/test.img (built first) and keep the console and kernel log
                             (--stay: leave it running; --quiet: restarts into the bootloader; --speaker: sound on)
@@ -11,7 +13,9 @@
 
 Every run's output goes to [paths] logs/<command>-<time>/.
 """
-import argparse, datetime, os, subprocess, sys, time
+import argparse, datetime, os, struct, subprocess, sys, time
+
+from . import fat
 
 try:
     import tomllib
@@ -82,6 +86,82 @@ def cmd_kernel(a):
     say('kernel:', stripped, '(%d bytes)' % os.path.getsize(stripped))
 
 
+# ---- loader -----------------------------------------------------------------------------------------------------------
+def cmd_loader(a):
+    log = os.path.join(rundir('loader'), 'build.log')
+    edk2 = os.path.join(ROOT, '.cache', 'mu_basecore')
+    if not os.path.exists(os.path.join(edk2, 'MdePkg', 'MdePkg.dec')):
+        sys.exit('ak: no %s: git clone --depth 1 -b release/202608 https://github.com/microsoft/mu_basecore there, then\n'
+                 '    git submodule update --init --depth 1 MdePkg/Library/BaseFdtLib/libfdt MdePkg/Library/MipiSysTLib/mipisyst '
+                 'BaseTools/Source/C/BrotliCompress/brotli' % edk2)
+    if not os.path.exists(os.path.join(edk2, 'BaseTools', 'Source', 'C', 'bin', 'GenFw')):
+        sh(['make', '-C', os.path.join(edk2, 'BaseTools', 'Source', 'C'), '-j%d' % os.cpu_count()], log=log)
+    work = os.path.join(path('out'), 'loader-build')
+    os.makedirs(os.path.join(work, 'Build', 'Conf'), exist_ok=True)
+    for f in ('target', 'tools_def', 'build_rule'):
+        dst = os.path.join(work, 'Build', 'Conf', f + '.txt')
+        if not os.path.exists(dst):
+            sh(['cp', os.path.join(edk2, 'BaseTools', 'Conf', f + '.template'), dst])
+    lo = os.path.join(ROOT, 'loader')
+    e = dict(os.environ, WORKSPACE=work, EDK_TOOLS_PATH=os.path.join(edk2, 'BaseTools'), PYTHON_COMMAND='python3',
+             CONF_PATH=os.path.join(work, 'Build', 'Conf'), CLANG_BIN='/usr/bin/',
+             PACKAGES_PATH=':'.join([lo, lo + '/DarwinBoot', lo + '/UniXNU', edk2]))
+    e['PATH'] = ':'.join([edk2 + '/BaseTools/BinWrappers/PosixLike', edk2 + '/BaseTools/Source/C/bin', e['PATH']])
+    say('building the loader (log:', log + ')')
+    sh(['build', '-p', 'AkitaPkg/AkitaPkg.dsc', '-a', 'AARCH64', '-b', 'DEBUG', '-t', 'CLANGPDB', '-n', str(os.cpu_count())],
+       log=log, env=e, cwd=lo)
+    out = os.path.join(path('out'), 'loader')
+    os.makedirs(out, exist_ok=True)
+    for f in ('AkiosBoot.efi', 'DarwinBoot.efi', 'Fat.efi'):
+        sh(['cp', os.path.join(work, 'Build', 'Akita', 'DEBUG_CLANGPDB', 'AARCH64', f), out])
+    say('loader:', out)
+
+
+def payload(items):
+    """the boot payload U-Boot copies to 0xF0000000: "XNUP", then name[16]/size/reserved/data entries"""
+    body = b''
+    for name, data in items:
+        body += struct.pack('<16sII', name.encode(), len(data), 0) + data + b'\0' * (-len(data) % 16)
+    body += b'\0' * 32
+    return struct.pack('<II', 0x50554E58, len(body)) + body
+
+
+def akios_toml(line, failsafe):
+    q = lambda v: '"%s"' % v.replace('\\', '\\\\').replace('"', '\\"')
+    return '\n'.join([
+        '# made by ak: the boot manager\'s config on the ESP', 'version = 1', '',
+        '[boot]', 'timeout = 3', 'default = "akios"', '',
+        '[ui]', 'title = "AkIOS"', '',
+        '[[driver]]', 'path = "DarwinBoot.efi"', '',
+        '[[entry]]', 'id = "akios"', 'title = "AkIOS"', 'type = "xnu"', 'path = "kernel"', 'args = ' + q(line), '',
+        '[[entry]]', 'id = "reset"', 'title = "Restart"', 'type = "action"', 'action = "reset"', ''])
+
+
+def make_new_image(flash, line, name):
+    """the new loader's image: U-Boot starts AkiosBoot.efi; the payload has Fat.efi and the ESP image"""
+    out, lo = path('out'), os.path.join(path('out'), 'loader')
+    for f in ('AkiosBoot.efi', 'DarwinBoot.efi', 'Fat.efi'):
+        if not os.path.exists(os.path.join(lo, f)):
+            sys.exit('ak: no out/loader/%s: run `ak loader` first' % f)
+    failsafe = 0 if flash else CONF['test'].get('loader_failsafe', 120)
+    rd = lambda f: open(f, 'rb').read()
+    esp = fat.make_fat({
+        'EFI/UniXNU/akios.toml': akios_toml(line, failsafe).encode(),
+        'EFI/UniXNU/DarwinBoot.efi': rd(os.path.join(lo, 'DarwinBoot.efi')),
+        'EFI/UniXNU/kernel': rd(os.path.join(out, 'kernel')),
+    })
+    open(os.path.join(out, name + '-esp.img'), 'wb').write(esp)
+    items = [('fat', rd(os.path.join(lo, 'Fat.efi'))), ('esp', esp)]
+    if failsafe:
+        items.append(('failsafe', b'%d\0' % failsafe))
+    pl = os.path.join(out, name + '-payload.bin')
+    open(pl, 'wb').write(payload(items))
+    img = os.path.join(out, name + '.img')
+    sh(['python3', LEGACY + '/tools/mkubootimg.py', '-d', CONF['phone']['name'], '-l', os.path.join(lo, 'AkiosBoot.efi'),
+        '-p', pl, '-o', img], log='/dev/null')
+    return img
+
+
 # ---- images -----------------------------------------------------------------------------------------------------------
 def quiet_now():
     a, b = CONF['test']['quiet_hours']
@@ -107,7 +187,7 @@ def cmdline(flash, extra, quiet, speaker=False):
     return line
 
 
-def make_image(flash, extra, quiet, speaker=False):
+def make_image(flash, extra, quiet, speaker=False, new_loader=False):
     out = path('out')
     kernel = os.path.join(out, 'kernel')
     if not os.path.exists(kernel):
@@ -115,6 +195,11 @@ def make_image(flash, extra, quiet, speaker=False):
     name = 'flash' if flash else 'test'
     payload, img = os.path.join(out, name + '-payload.bin'), os.path.join(out, name + '.img')
     line = cmdline(flash, extra, quiet, speaker)
+    if new_loader:
+        img = make_new_image(flash, line, name)
+        open(os.path.join(out, name + '.cmdline'), 'w').write(line + '\n')
+        say(name + ' image (new loader):', img)
+        return img
     sh(['python3', LEGACY + '/xnuloader/mkpayload.py', '-o', payload, 'kernel=' + kernel,
         'ramdisk=' + LEGACY + '/userland/root.apfs', 'resident=' + LEGACY + '/userland/flashboot.apfs', '--cmdline', line],
        log='/dev/null')
@@ -125,7 +210,7 @@ def make_image(flash, extra, quiet, speaker=False):
 
 
 def cmd_image(a):
-    make_image(a.flash, a.args, a.quiet or (not a.flash and quiet_now()), a.speaker)
+    make_image(a.flash, a.args, a.quiet or (not a.flash and quiet_now()), a.speaker, a.new_loader)
 
 
 # ---- the phone --------------------------------------------------------------------------------------------------------
@@ -179,7 +264,7 @@ def usbmux_log(dest, kernel=False, secs=15):
 
 def cmd_boot(a):
     quiet = a.quiet or quiet_now()
-    img = make_image(False, a.args, quiet, a.speaker)
+    img = make_image(False, a.args, quiet, a.speaker, a.new_loader)
     d = rundir('boot-' + a.name)
     to_bootloader()
     if fastboot('getvar', 'current-slot').stderr.find('current-slot: ' + CONF['flash']['slot']) >= 0:
@@ -222,11 +307,13 @@ def main():
     p = argparse.ArgumentParser(prog='ak', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     s = p.add_subparsers(dest='cmd', required=True)
     s.add_parser('kernel').set_defaults(f=cmd_kernel)
+    s.add_parser('loader').set_defaults(f=cmd_loader)
     i = s.add_parser('image'); i.add_argument('--flash', action='store_true'); i.add_argument('--quiet', action='store_true')
-    i.add_argument('--speaker', action='store_true'); i.add_argument('args', nargs='*'); i.set_defaults(f=cmd_image)
+    i.add_argument('--speaker', action='store_true'); i.add_argument('--new-loader', action='store_true')
+    i.add_argument('args', nargs='*'); i.set_defaults(f=cmd_image)
     b = s.add_parser('boot'); b.add_argument('name'); b.add_argument('--stay', action='store_true')
     b.add_argument('--quiet', action='store_true'); b.add_argument('--wait', type=int, default=60)
-    b.add_argument('--speaker', action='store_true')
+    b.add_argument('--speaker', action='store_true'); b.add_argument('--new-loader', action='store_true')
     b.add_argument('args', nargs='*'); b.set_defaults(f=cmd_boot)
     f = s.add_parser('flash'); f.add_argument('args', nargs='*'); f.set_defaults(f=cmd_flash)
     l = s.add_parser('log'); l.add_argument('--kernel', action='store_true'); l.add_argument('--secs', type=int, default=15)

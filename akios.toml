@@ -29,6 +29,7 @@ cmdline_max = 900
 [test]
 # RAM test boots: safety nets on (the phone comes back to Android / the bootloader by itself)
 usb_lost_reboot   = 90                 # s without a USB host
+loader_failsafe   = 120                # s in the new loader before it restarts the phone (no XNU by then)
 test_reboot_after = 1200               # s after boot
 quiet_hours       = [22, 9]            # local time: speaker=0, restart into the bootloader
 
