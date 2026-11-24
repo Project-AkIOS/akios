@@ -243,9 +243,14 @@ def make_new_image(flash, line, name):
 ESP_BYTES = 512 << 20
 
 
-ESP_RAMDISK = LEGACY + '/userland/root.apfs'            # the RAM disk the entry hands DarwinBoot (its initrd)
-# (xnuloader had two: flashboot.apfs as md0, the root, whose /sbin/launchd mounts the Darwin volume on the flash, and
-# root.apfs as md1; DarwinBoot places one: --initrd picks it)
+# the RAM disk the entry hands DarwinBoot (its initrd, md0, the root): out/akios.apfs when `ak userland` has made it,
+# else the old tree's root.apfs (xnuloader had two: flashboot.apfs as md0, whose /sbin/launchd mounts the system
+# volume, and root.apfs as md1; DarwinBoot places one); --initrd picks another
+def esp_ramdisk():
+    new = os.path.join(path('out'), 'akios.apfs')
+    return new if os.path.exists(new) else LEGACY + '/userland/root.apfs'
+
+
 IPHONE_TREE = LEGACY + '/sysimage-d16ap/DeviceTree.d16ap.im4p'   # whose identity Darwin's user space gets
 
 
@@ -262,7 +267,7 @@ def cmd_esp(a):
     if not adt.word(line, 'rd='):
         line += ' rd=md0'
     serial = open(os.path.expanduser('~/akita/usb_serial')).readline().strip()
-    ramdisk = os.path.expanduser(a.initrd or ESP_RAMDISK)
+    ramdisk = os.path.expanduser(a.initrd or esp_ramdisk())
     tree = adt.build(line, IPHONE_TREE, serial, ramdisk=True)
     open(os.path.join(out, 'kernel.adt'), 'wb').write(tree)
     files = {
@@ -429,7 +434,7 @@ def main():
     u.set_defaults(f=cmd_userland)
     s.add_parser('firmware').set_defaults(f=cmd_firmware)
     e = s.add_parser('esp'); e.add_argument('--quiet', action='store_true'); e.add_argument('--speaker', action='store_true')
-    e.add_argument('--initrd', help='the RAM disk (default: the legacy tree\'s userland/root.apfs)')
+    e.add_argument('--initrd', help='the RAM disk (default: out/akios.apfs, else the legacy tree\'s userland/root.apfs)')
     e.add_argument('args', nargs='*'); e.set_defaults(f=cmd_esp)
     w = s.add_parser('fwboot'); w.add_argument('name'); w.add_argument('--wait', type=int, default=300)
     w.set_defaults(f=cmd_fwboot)
