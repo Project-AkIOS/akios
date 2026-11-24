@@ -4,6 +4,7 @@
 /loader/
 /userland/
 /device/
+/firmware/
 # what ak makes
 /out/
 /work/
