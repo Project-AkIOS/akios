@@ -181,7 +181,7 @@ def cmd_loader(a):
        log=log, env=e, cwd=lo)
     out = os.path.join(path('out'), 'loader')
     os.makedirs(out, exist_ok=True)
-    for f in ('AkiosBoot.efi', 'DarwinBoot.efi', 'Fat.efi'):
+    for f in ('AkiosBoot.efi', 'DarwinBoot.efi', 'Fat.efi', 'UniXNU.efi'):
         sh(['cp', os.path.join(work, 'Build', 'Akita', 'DEBUG_CLANGPDB', 'AARCH64', f), out])
     say('loader:', out)
 
@@ -229,6 +229,30 @@ def make_new_image(flash, line, name):
     sh(['python3', LEGACY + '/tools/mkubootimg.py', '-d', CONF['phone']['name'], '-l', os.path.join(lo, 'AkiosBoot.efi'),
         '-p', pl, '-o', img], log='/dev/null')
     return img
+
+
+# ---- the ESP (our firmware's boot volume, the phone's "esp" partition) --------------------------------------------
+ESP_BYTES = 512 << 20
+
+
+def cmd_esp(a):
+    """out/esp.img (and esp.simg for fastboot): UniXNU as the removable-media loader, its config, DarwinBoot, the kernel"""
+    out, lo = path('out'), os.path.join(path('out'), 'loader')
+    for f in ('UniXNU.efi', 'DarwinBoot.efi'):
+        if not os.path.exists(os.path.join(lo, f)):
+            sys.exit('ak: no out/loader/%s: run `ak loader` first' % f)
+    rd = lambda f: open(f, 'rb').read()
+    line = cmdline(False, a.args, a.quiet or quiet_now(), a.speaker)
+    files = {
+        'EFI/BOOT/BOOTAA64.EFI': rd(os.path.join(lo, 'UniXNU.efi')),
+        'EFI/UniXNU/akios.toml': akios_toml(line, 0).encode(),
+        'EFI/UniXNU/DarwinBoot.efi': rd(os.path.join(lo, 'DarwinBoot.efi')),
+        'EFI/UniXNU/kernel': rd(os.path.join(out, 'kernel')),
+    }
+    img = os.path.join(out, 'esp.img')
+    open(img, 'wb').write(fat.make_fat(files, label='AKIOS ESP', size=ESP_BYTES))
+    sh(['img2simg', img, os.path.join(out, 'esp.simg')])
+    say('ESP:', img, '(and esp.simg); `fastboot flash esp out/esp.simg` writes it')
 
 
 # ---- images -----------------------------------------------------------------------------------------------------------
@@ -378,6 +402,8 @@ def main():
     s.add_parser('kernel').set_defaults(f=cmd_kernel)
     s.add_parser('loader').set_defaults(f=cmd_loader)
     s.add_parser('firmware').set_defaults(f=cmd_firmware)
+    e = s.add_parser('esp'); e.add_argument('--quiet', action='store_true'); e.add_argument('--speaker', action='store_true')
+    e.add_argument('args', nargs='*'); e.set_defaults(f=cmd_esp)
     w = s.add_parser('fwboot'); w.add_argument('name'); w.add_argument('--wait', type=int, default=300)
     w.set_defaults(f=cmd_fwboot)
     i = s.add_parser('image'); i.add_argument('--flash', action='store_true'); i.add_argument('--quiet', action='store_true')
