@@ -1,0 +1,11 @@
+# the sub-repositories (each its own git repository; submodules once they have commits)
+/xnu/
+/metal/
+/loader/
+/userland/
+/device/
+# what ak makes
+/out/
+/work/
+/.cache/
+__pycache__/

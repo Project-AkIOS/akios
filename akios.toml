@@ -1,0 +1,39 @@
+# akios.toml: what `ak` builds, boots and flashes. Paths are relative to this directory unless absolute (~ allowed).
+
+[paths]
+xnu      = "xnu"                       # our XNU fork (Apple's tag first, our commits on top)
+out      = "out"                       # what ak makes: kernel, images
+logs     = "~/akita/logs/ak"           # one directory a run
+# (transition) what has not moved yet comes from the old tree
+legacy   = "~/akita/hakios-base"
+
+[kernel]
+config   = "DEVELOPMENT"
+machine  = "BCM2837"                   # the slot our platform builds in
+version  = "25.6.0"                    # RC_DARWIN_KERNEL_VERSION
+
+[phone]
+name     = "akita"
+# the command line every boot gets (the loader adds the device's own: devices/akita/soc.args)
+cmdline  = [
+  "debug=0x8", "cpus=9", "ufs=2", "ufs_write=1", "torch=3", "hakios_arm64e=1",
+  "wifi=0", "pcie=0",
+  "ca_metallib=/akita/share/ca-share/QuartzCore-default.metallib",
+  "display_hz=120", "fbwidth=1080", "fbheight=2340", "fbscale=3", "fbsubtype=2340", "fb_zc=1", "anim_max=1",
+  "metal=1", "metal_plugin=../../../akita/lib/HakiosMetal", "metal_all=1", "mali_keep=1", "display_flip=1",
+  "dvfs=1", "thermal=1",
+]
+# the boot line is cut at about 1000 characters: past this, ak refuses to build an image
+cmdline_max = 900
+
+[test]
+# RAM test boots: safety nets on (the phone comes back to Android / the bootloader by itself)
+usb_lost_reboot   = 90                 # s without a USB host
+test_reboot_after = 1200               # s after boot
+quiet_hours       = [22, 9]            # local time: speaker=0, restart into the bootloader
+
+[flash]
+slot = "b"
+# a flashed image has no kill switches: it is the owner's to use unplugged
+usb_lost_reboot   = 0
+test_reboot_after = 0
