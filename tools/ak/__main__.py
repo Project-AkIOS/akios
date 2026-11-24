@@ -17,7 +17,7 @@ Every run's output goes to [paths] logs/<command>-<time>/.
 """
 import argparse, datetime, os, struct, subprocess, sys, time
 
-from . import fat
+from . import adt, fat
 
 try:
     import tomllib
@@ -195,14 +195,15 @@ def payload(items):
     return struct.pack('<II', 0x50554E58, len(body)) + body
 
 
-def akios_toml(line, failsafe):
+def akios_toml(line, failsafe, initrd=None):
     q = lambda v: '"%s"' % v.replace('\\', '\\\\').replace('"', '\\"')
     return '\n'.join([
         '# made by ak: the boot manager\'s config on the ESP', 'version = 1', '',
         '[boot]', 'timeout = 3', 'default = "akios"', '',
         '[ui]', 'title = "AkIOS"', '',
         '[[driver]]', 'path = "DarwinBoot.efi"', '',
-        '[[entry]]', 'id = "akios"', 'title = "AkIOS"', 'type = "xnu"', 'path = "kernel"', 'args = ' + q(line), '',
+        '[[entry]]', 'id = "akios"', 'title = "AkIOS"', 'type = "xnu"', 'path = "kernel"', 'args = ' + q(line)] +
+        (['initrd = ' + q(initrd)] if initrd else []) + ['',
         '[[entry]]', 'id = "reset"', 'title = "Restart"', 'type = "action"', 'action = "reset"', ''])
 
 
@@ -235,19 +236,35 @@ def make_new_image(flash, line, name):
 ESP_BYTES = 512 << 20
 
 
+ESP_RAMDISK = LEGACY + '/userland/root.apfs'            # the RAM disk the entry hands DarwinBoot (its initrd)
+# (xnuloader had two: flashboot.apfs as md0, the root, whose /sbin/launchd mounts the Darwin volume on the flash, and
+# root.apfs as md1; DarwinBoot places one: --initrd picks it)
+IPHONE_TREE = LEGACY + '/sysimage-d16ap/DeviceTree.d16ap.im4p'   # whose identity Darwin's user space gets
+
+
 def cmd_esp(a):
-    """out/esp.img (and esp.simg for fastboot): UniXNU as the removable-media loader, its config, DarwinBoot, the kernel"""
+    """out/esp.img (and esp.simg for fastboot): UniXNU as the removable-media loader, its config, DarwinBoot, the
+    kernel, its device tree (kernel.adt, tools/ak/adt.py) and the RAM disk"""
     out, lo = path('out'), os.path.join(path('out'), 'loader')
     for f in ('UniXNU.efi', 'DarwinBoot.efi'):
         if not os.path.exists(os.path.join(lo, f)):
             sys.exit('ak: no out/loader/%s: run `ak loader` first' % f)
     rd = lambda f: open(f, 'rb').read()
     line = cmdline(False, a.args, a.quiet or quiet_now(), a.speaker)
+    # the RAM disk is the root (md0) unless the line names one, as xnuloader had it
+    if not adt.word(line, 'rd='):
+        line += ' rd=md0'
+    serial = open(os.path.expanduser('~/akita/usb_serial')).readline().strip()
+    ramdisk = os.path.expanduser(a.initrd or ESP_RAMDISK)
+    tree = adt.build(line, IPHONE_TREE, serial, ramdisk=True)
+    open(os.path.join(out, 'kernel.adt'), 'wb').write(tree)
     files = {
         'EFI/BOOT/BOOTAA64.EFI': rd(os.path.join(lo, 'UniXNU.efi')),
-        'EFI/UniXNU/akios.toml': akios_toml(line, 0).encode(),
+        'EFI/UniXNU/akios.toml': akios_toml(line, 0, initrd=os.path.basename(ramdisk)).encode(),
         'EFI/UniXNU/DarwinBoot.efi': rd(os.path.join(lo, 'DarwinBoot.efi')),
         'EFI/UniXNU/kernel': rd(os.path.join(out, 'kernel')),
+        'EFI/UniXNU/kernel.adt': tree,
+        'EFI/UniXNU/' + os.path.basename(ramdisk): rd(ramdisk),
     }
     img = os.path.join(out, 'esp.img')
     open(img, 'wb').write(fat.make_fat(files, label='AKIOS ESP', size=ESP_BYTES))
@@ -403,6 +420,7 @@ def main():
     s.add_parser('loader').set_defaults(f=cmd_loader)
     s.add_parser('firmware').set_defaults(f=cmd_firmware)
     e = s.add_parser('esp'); e.add_argument('--quiet', action='store_true'); e.add_argument('--speaker', action='store_true')
+    e.add_argument('--initrd', help='the RAM disk (default: the legacy tree\'s userland/root.apfs)')
     e.add_argument('args', nargs='*'); e.set_defaults(f=cmd_esp)
     w = s.add_parser('fwboot'); w.add_argument('name'); w.add_argument('--wait', type=int, default=300)
     w.set_defaults(f=cmd_fwboot)
