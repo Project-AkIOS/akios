@@ -1,10 +1,6 @@
-# the sub-repositories (each its own git repository; submodules once they have commits)
-/xnu/
+# the sub-repositories are submodules (.gitmodules)
 /metal/
-/loader/
-/userland/
 /device/
-/firmware/
 # what ak makes
 /out/
 /work/

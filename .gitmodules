@@ -1,0 +1,12 @@
+[submodule "xnu"]
+	path = xnu
+	url = https://github.com/Project-AkIOS/xnu.git
+[submodule "loader"]
+	path = loader
+	url = https://github.com/Project-AkIOS/loader.git
+[submodule "firmware"]
+	path = firmware
+	url = https://github.com/Project-AkIOS/firmware.git
+[submodule "userland"]
+	path = userland
+	url = https://github.com/Project-AkIOS/userland.git
