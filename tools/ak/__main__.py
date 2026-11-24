@@ -1,6 +1,8 @@
 """ak: AkIOS's build, boot and flash tool.
 
   ak kernel                 configure and build the kernel from xnu/ (out/kernel, out/kernel.full)
+  ak firmware               build our EDK2 firmware (firmware/ inside .cache/mu-silicium) into out/firmware.img
+  ak fwboot NAME            RAM-boot out/firmware.img, wait for the phone to come back to Android, keep its log
   ak loader                 build the UEFI loader from loader/ (out/loader: AkiosBoot.efi, DarwinBoot.efi, Fat.efi)
   ak image [--flash] [--new-loader] [ARGS]
                             make a boot image from out/kernel and the current userland (out/test.img, or with
@@ -103,6 +105,54 @@ def cmd_kernel(a):
     sh(['cp', '-p', k, stripped])
     sh([LEGACY + '/xnu-deps/host/bin/strip', '-x', stripped])
     say('kernel:', stripped, '(%d bytes)' % os.path.getsize(stripped))
+
+
+# ---- firmware ---------------------------------------------------------------------------------------------------------
+def cmd_firmware(a):
+    mu, fw = os.path.join(ROOT, '.cache', 'mu-silicium'), os.path.join(ROOT, 'firmware')
+    venv = os.path.join(ROOT, '.cache', 'mu-venv', 'bin', 'python3')
+    if not os.path.exists(os.path.join(mu, 'build_uefi.py')) or not os.path.exists(venv):
+        sys.exit('ak: no Mu-Silicium in .cache/mu-silicium (with its submodules) or no .cache/mu-venv')
+    for link, target in (('Platforms/Google', 'Platforms/Google'), ('Silicon/Google', 'Silicon/Google'),
+                         ('Resources/Configs/akita.toml', 'Resources/Configs/akita.toml')):
+        dst = os.path.join(mu, link)
+        if not os.path.islink(dst):
+            os.symlink(os.path.join(fw, target), dst)
+    log = os.path.join(rundir('firmware'), 'build.log')
+    say('building the firmware (log:', log + ')')
+    sh([venv, 'build_uefi.py', '-d', CONF['phone']['name'], '-r', 'DEBUG'], log=log, cwd=mu)
+    kernel = bytearray(open(os.path.join(mu, 'Build', 'akitaPkg', 'akita-kernel'), 'rb').read())
+    # ABL places an arm64 Image at the start of RAM + text_offset (Linux's rule); BootShim's header has the FD's
+    # address there: 0, the size, and flags 0xa (little endian, 4K pages, anywhere). The shim copies the FD itself.
+    struct.pack_into('<QQQ', kernel, 8, 0, (len(kernel) + 0xfff) & ~0xfff, 0xa)
+    out = path('out')
+    os.makedirs(out, exist_ok=True)
+    open(os.path.join(out, 'firmware-kernel'), 'wb').write(kernel)
+    img = os.path.join(out, 'firmware.img')
+    sh(['python3', LEGACY + '/tools/mkubootimg.py', '-d', CONF['phone']['name'], '-u', os.path.join(out, 'firmware-kernel'),
+        '--no-ramdisk', '-o', img], log=log)
+    say('firmware image:', img)
+
+
+def cmd_fwboot(a):
+    img = os.path.join(path('out'), 'firmware.img')
+    d = rundir('fwboot-' + a.name)
+    to_bootloader()
+    r = fastboot('boot', img, timeout=120)
+    if r.returncode != 0:
+        sys.exit('ak: fastboot boot failed: ' + r.stderr.strip()[-200:])
+    t0 = time.time()
+    say('started; waiting for the phone to come back to Android (the firmware log is read from pstore there)')
+    time.sleep(10)
+    while time.time() - t0 < a.wait and not in_android():
+        time.sleep(4)
+    if not in_android():
+        sys.exit('ak: not back in Android after %d s (the phone may sit in the firmware or the bootloader)' % a.wait)
+    time.sleep(5)
+    for f in ('pmsg-ramoops-0', 'console-ramoops-0'):
+        with open(os.path.join(d, f + '.txt'), 'w') as o:
+            subprocess.run(['adb', 'shell', 'su', '-c', 'cat /sys/fs/pstore/' + f], stdout=o, stderr=subprocess.STDOUT)
+    say('back after %d s; logs in %s' % (time.time() - t0, d))
 
 
 # ---- loader -----------------------------------------------------------------------------------------------------------
@@ -327,6 +377,9 @@ def main():
     s = p.add_subparsers(dest='cmd', required=True)
     s.add_parser('kernel').set_defaults(f=cmd_kernel)
     s.add_parser('loader').set_defaults(f=cmd_loader)
+    s.add_parser('firmware').set_defaults(f=cmd_firmware)
+    w = s.add_parser('fwboot'); w.add_argument('name'); w.add_argument('--wait', type=int, default=300)
+    w.set_defaults(f=cmd_fwboot)
     i = s.add_parser('image'); i.add_argument('--flash', action='store_true'); i.add_argument('--quiet', action='store_true')
     i.add_argument('--speaker', action='store_true'); i.add_argument('--new-loader', action='store_true')
     i.add_argument('args', nargs='*'); i.set_defaults(f=cmd_image)
