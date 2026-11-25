@@ -268,7 +268,8 @@ def cmd_esp(a):
         if not os.path.exists(os.path.join(lo, f)):
             sys.exit('ak: no out/loader/%s: run `ak loader` first' % f)
     rd = lambda f: open(f, 'rb').read()
-    line = cmdline(False, a.args, a.quiet or quiet_now(), a.speaker)
+    # --flash: the image the owner uses unplugged ([flash] in akios.toml: no kill switches, no test arguments)
+    line = cmdline(a.flash, a.args, a.quiet or (not a.flash and quiet_now()), a.speaker)
     # the RAM disk is the root (md0) unless the line names one, as xnuloader had it
     if not adt.word(line, 'rd='):
         line += ' rd=md0'
@@ -304,7 +305,7 @@ def cmdline(flash, extra, quiet, speaker=False):
     args[1:1] = ['usb_lost_reboot=%d' % k['usb_lost_reboot'], 'test_reboot_after=%d' % k['test_reboot_after'],
                  'usb_serial=' + serial]
     # (speaker=0 by default as in liveboot.sh; a flashed image gets the owner's sound)
-    args.append('speaker=1' if (speaker and not quiet) or flash else 'speaker=0')
+    args.append('speaker=1' if (speaker or flash) and not quiet else 'speaker=0')
     if not flash:
         args.append('halt_restarts=1')   # a test boot never powers the phone off (the kernel restarts instead)
     if quiet and not flash:
@@ -442,6 +443,7 @@ def main():
     u.set_defaults(f=cmd_userland)
     s.add_parser('firmware').set_defaults(f=cmd_firmware)
     e = s.add_parser('esp'); e.add_argument('--quiet', action='store_true'); e.add_argument('--speaker', action='store_true')
+    e.add_argument('--flash', action='store_true', help='the unplugged image: no kill switches, no test arguments')
     e.add_argument('--initrd', help='the RAM disk (default: out/akios.apfs, else the legacy tree\'s userland/root.apfs)')
     e.add_argument('args', nargs='*'); e.set_defaults(f=cmd_esp)
     w = s.add_parser('fwboot'); w.add_argument('name'); w.add_argument('--wait', type=int, default=300)
