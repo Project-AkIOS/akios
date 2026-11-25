@@ -152,6 +152,12 @@ def cmd_fwboot(a):
     say('started; waiting for the phone to come back to Android (the firmware log is read from pstore there)')
     time.sleep(10)
     while time.time() - t0 < a.wait and not in_android():
+        # a test boot restarts into the bootloader when it is quiet (restart_fastboot=1): from there, a warm restart
+        # into Android, which keeps pstore (the boot's log)
+        if time.time() - t0 > 30 and in_fastboot():
+            say('in the bootloader after %d s: restarting into Android to read pstore' % (time.time() - t0))
+            fastboot('reboot', timeout=30)
+            time.sleep(10)
         time.sleep(4)
     if not in_android():
         sys.exit('ak: not back in Android after %d s (the phone may sit in the firmware or the bootloader)' % a.wait)
@@ -299,6 +305,8 @@ def cmdline(flash, extra, quiet, speaker=False):
                  'usb_serial=' + serial]
     # (speaker=0 by default as in liveboot.sh; a flashed image gets the owner's sound)
     args.append('speaker=1' if (speaker and not quiet) or flash else 'speaker=0')
+    if not flash:
+        args.append('halt_restarts=1')   # a test boot never powers the phone off (the kernel restarts instead)
     if quiet and not flash:
         args.append('restart_fastboot=1')
     args += extra
