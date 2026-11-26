@@ -53,7 +53,7 @@ symbols_db  = "~/akita/ref/symbols-24B156.sqlite"         # its symbol database:
 
 [phone]
 name     = "akita"
-# the command line every boot gets (the loader adds the device's own: devices/akita/soc.args)
+# the command line every boot gets
 cmdline  = [
   "debug=0x8", "cpus=9", "ufs=2", "ufs_write=1", "torch=3", "hakios_arm64e=1",
   "wifi=8", "pcie=5",
