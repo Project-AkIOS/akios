@@ -666,6 +666,12 @@ int hakios_metal_texture_plan(hakios_metal_device *device, unsigned type, unsign
  * hakios_metal_texture_free() frees only the wrapper. NULL with the reason. */
 hakios_metal_texture *hakios_metal_texture_wrap(hakios_metal_device *device, const struct hakios_metal_texture_layout *layout,
     uint64_t gpu_va, void *cpu);
+/* a 2D, one-level texture of PIXEL_FORMAT over rows that exist already (an IOSurface plane IOGPU made a resource of):
+ * HEIGHT rows of ROW_BYTES from GPU_VA, LENGTH bytes there in all; CPU its mapping or NULL (the CPU paths are then the
+ * caller's). The GPU samples linear rows from 64-byte multiples only: a pitch or start that is not one is refused, by
+ * name, as a depth or stencil format is. hakios_metal_texture_free() frees only the wrapper. */
+hakios_metal_texture *hakios_metal_texture_wrap_rows(hakios_metal_device *device, unsigned pixel_format, unsigned width,
+    unsigned height, unsigned usage, uint64_t gpu_va, void *cpu, uint64_t length, uint32_t row_bytes);
 /* Command buffers of a device over IOGPU: recorded as any other (copy, fill, blit, dispatch...), then
  *   _build    everything up to the stream, written into memory from OPS: *VA and *LENGTH (bytes) what the GPU is to run,
  *             LENGTH 0 when nothing was recorded; -1 (and LENGTH 0) when the command buffer failed already -- its error

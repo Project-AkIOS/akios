@@ -602,7 +602,9 @@ struct hakios_metal_device {
 
 // the zeroes that stand for a buffer or a texture a function declares and nothing is bound at (see the device's
 // nothing_bo); 0 / nullptr if they cannot be made
-inline std::atomic<uint64_t> gNothingVa{0};
+// (per device, 11-26: the zeroes of the device whose draw this thread is recording -- nothingVa(d) sets it -- not one
+// address for the process: two devices of one process have two GPU address spaces under IOGPU)
+inline thread_local uint64_t gNothingVa = 0;
 uint64_t nothingVa(hakios_metal_device *d);
 hakios_metal_texture *nothingTexture(hakios_metal_device *d);
 namespace mali {

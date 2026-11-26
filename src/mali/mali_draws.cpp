@@ -54,12 +54,12 @@ stagePushConstants(const mali_kernel_binary &b, hakios_metal_buffer *const *buff
         }
         if (res.index >= count || buffers[res.index] == nullptr) {
             // (nothing bound: the device's zeroes stand for it -- gNothingVa, set by the draw before this)
-            if (gNothingVa.load() == 0) {
+            if (gNothingVa == 0) {
                 fail("draw with %s: nothing bound at [[buffer(%u)]]", b.name, res.index);
                 return false;
             }
-            fau[2 * res.slot] = (uint32_t)gNothingVa.load();
-            fau[2 * res.slot + 1] = (uint32_t)(gNothingVa.load() >> 32);
+            fau[2 * res.slot] = (uint32_t)gNothingVa;
+            fau[2 * res.slot + 1] = (uint32_t)(gNothingVa >> 32);
             continue;
         }
         uint64_t va = buffers[res.index]->bo.va + (offsets ? offsets[res.index] : 0);

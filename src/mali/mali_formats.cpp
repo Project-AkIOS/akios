@@ -25,9 +25,9 @@ nothingVa(hakios_metal_device *d)
         if (d->nothing_va.load() == 0 && d->newBo(d->nothing_bo, 0x10000, BIND_NOEXEC)) {
             memset(d->nothing_bo.cpu, 0, 0x10000);
             d->nothing_va = d->nothing_bo.va;
-            gNothingVa = d->nothing_bo.va;
         }
     }
+    gNothingVa = d->nothing_va.load();     // (this thread's draw: this device's zeroes)
     return d->nothing_va.load();
 }
 namespace mali {

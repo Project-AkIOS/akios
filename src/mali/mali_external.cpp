@@ -407,6 +407,31 @@ hakios_metal_texture_wrap(hakios_metal_device *d, const struct hakios_metal_text
     return t;
 }
 
+hakios_metal_texture *
+hakios_metal_texture_wrap_rows(hakios_metal_device *d, unsigned pixel_format, unsigned width, unsigned height, unsigned usage,
+    uint64_t gpu_va, void *cpu, uint64_t length, uint32_t row_bytes)
+{
+    const MaliFormat *f = findFormat(pixel_format);
+    if (d == nullptr || f == nullptr || (pixel_format >= 250 && pixel_format <= 261) || f->bw != 1 || f->bh != 1) {
+        fail("a texture over existing rows of MTLPixelFormat %u (a colour format of the Mali's, not compressed, not depth)",
+            pixel_format);
+        return nullptr;
+    }
+    if (width == 0 || height == 0 || width > 16384 || height > 16384 || gpu_va == 0 || (gpu_va & 63) || (row_bytes & 63) ||
+        row_bytes < (uint64_t)width * f->bytes || (uint64_t)row_bytes * (height - 1) + (uint64_t)width * f->bytes > length) {
+        fail("a texture of %u x %u, MTLPixelFormat %u over rows of %u bytes at 0x%llx (%llu bytes): rows and start must be "
+            "64-byte multiples, inside the memory", width, height, pixel_format, row_bytes, (unsigned long long)gpu_va,
+            (unsigned long long)length);
+        return nullptr;
+    }
+    Bo bo;
+    bo.handle = 0;                  // (the memory is the caller's)
+    bo.size = length;
+    bo.va = gpu_va;
+    bo.cpu = cpu;
+    return textureOver(d, bo, 0, row_bytes, 2, f, pixel_format, width, height, usage, 0);
+}
+
 hakios_metal_cb *
 hakios_metal_cb_new_external(hakios_metal_device *d)
 {
