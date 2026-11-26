@@ -29,7 +29,7 @@ default_args = [
 # `ak userland`: the repository (userland/userland.toml says what goes into out/akios.apfs) and what it is built with.
 # Its manifest names these as @key.
 repo         = "userland"
-toolchain    = "~/akita/hakios-base/xnu-deps/host/bin"      # xnu-clang, ld64, otool
+toolchain    = ".cache/toolchain/host/bin"                # xnu-clang, ld64, otool (`ak toolchain`)
 sdk_target   = "16.5"                                        # xnu-clang's -target iOS version (as xnu-env.sh sets it)
 sdk          = "~/theos/sdks/iPhoneOS27.2.sdk"
 arch         = "arm64e"
@@ -37,9 +37,8 @@ ldid         = "~/theos/toolchain/linux/iphone/bin/ldid"
 ipsw         = "~/akita/akios-data/ipsw-d16ap"              # the unpacked IPSW: rootfs/ (launchd jobs), var.skel, build.conf
 firmware     = "~/akita/akios-data/firmware"                # its fw-*/: the vendor's files, never in git
 ca_share     = "~/ca-share"                                  # QuartzCore's default.metallib (tools/ca-metallib.py)
-# (transition) still in the old tree: Metal (its own repository later) and the APFS tools
-metal        = "~/akita/hakios-base/hakios-metal"
-metal_plugin = "~/akita/hakios-base/userland/src"           # HakiosMetalCA.m, HakiosMetal.plist
+metal        = "metal"
+metal_plugin = "metal/ca-plugin"                          # HakiosMetalCA.m, HakiosMetal.plist (the old plug-in)
 mkapfs       = "tools/apfs/mkapfs.py"
 apfs_reader  = "tools/apfs/apfs.py"
 carrierpack  = "tools/mkcarrierpack.py"

@@ -22,7 +22,6 @@ class Build:
         self.repo = ex(u['repo'])
         self.man = tomllib.load(open(os.path.join(self.repo, 'userland.toml'), 'rb'))
         self.vars = {k: ex(v) for k, v in u.items() if isinstance(v, str) and k not in ('arch', 'sdk_target')}
-        self.vars['legacy'] = path('legacy')
         self.arch = u.get('arch', 'arm64e')
         self.work = os.path.join(path('work') if 'work' in conf['paths'] else os.path.join(root, 'work'), 'userland')
         self.out = path('out')
@@ -36,7 +35,7 @@ class Build:
 
     # ---- helpers ----
     def x(self, s):
-        """@NAME -> akios.toml [userland] NAME (and @legacy: [paths] legacy)"""
+        """@NAME -> akios.toml [userland] NAME"""
         return re.sub(r'@([a-z_]+)', lambda m: self.vars[m.group(1)], s)
 
     def src(self, s):

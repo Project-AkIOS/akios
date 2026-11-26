@@ -1,8 +1,8 @@
 # the sub-repositories are submodules (.gitmodules)
-/metal/
 /device/
 # what ak makes
 /out/
 /work/
 /.cache/
 __pycache__/
+/metal/out/
