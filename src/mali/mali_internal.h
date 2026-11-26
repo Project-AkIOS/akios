@@ -25,6 +25,7 @@
 #include "hakios-metal/hakios_metal.h"
 
 #include <IOKit/IOKitLib.h>
+#include <IOKit/IODataQueueClient.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -50,6 +51,7 @@
 #include <string>
 #include <thread>
 #include <map>
+#include <set>
 #include <vector>
 
 #include "blit_shaders.h"
@@ -116,8 +118,65 @@ struct Bo {
     uint32_t bind = ~0u;                // newBo's bind flags (~0: not newBo's -- a surface's: never kept in the pool)
 };
 
+/*
+ * THE SECOND WAY TO THE KERNEL (11-26, boot-arg metal_iogpu=1): Apple's IOGPU interface -- IOServiceOpen type 1 on the
+ * same service, the kernel's IOGPUDeviceUserClient (akios_iogpu.cpp, with the Mali's parts in HakiosGPU) -- instead of
+ * panthor's requests on type 0. It is where the driver is going (IOGPU.framework's interface); panthor's stays the
+ * default until this one has been run on the phone as long.
+ *
+ * What differs for the back end:
+ *   memory    a resource (selector 8) instead of BO_CREATE + map + VM_BIND: the kernel maps it into the task and into
+ *             the client's one GPU address space at the SAME address (no address of ours any more), write-combined for
+ *             the processors (the GPU does not snoop their caches); a Bo's handle is the resource's id
+ *   surfaces  a resource of kind 0x82 (the IOSurface's id); refused for a surface around a client's memory, as
+ *             panthor's surface buffer is
+ *   queue     one IOGPU command queue for the device (the kernel makes it a CSF group of one queue in our address
+ *             space, as GROUP_CREATE did), and its notification queue: every submission (trap 0: the stream's address
+ *             and length) is answered twice there -- "scheduled" at once, "completed" when the GPU has passed it, with
+ *             a status (0, 0xb a page fault, 1/0xa refused or abandoned). A thread of ours takes the answers off and
+ *             hands each completed token to whoever waits for it (instead of SYNCOBJ_WAIT)
+ *   heap      the Mali's own selectors 56/57 on the type-1 connection (instead of TILER_HEAP_CREATE/DESTROY)
+ * What the type-1 interface does not have yet, and is still asked of a type-0 connection opened beside it (with no VM,
+ * no group, no buffers of its own): DEV_QUERY's description of the GPU, an IOSurface's description (0x7e with no buffer
+ * wanted), and the surface marks the display waits for (0x7d busy, 0x80 not on the panel, 0x7f the kernel's log). They
+ * move over when the kernel has them on type 1.
+ */
+struct IOGPUTransport {
+    io_connect_t conn = 0;                      // the type-1 connection (0: this transport is not used)
+    uint32_t queue = 0;                         // the command queue (selector 6)
+    uint32_t nq = 0;                            // its notification queue (selector 14)
+    uint32_t kcmd_shmem = 0, seg_shmem = 0;     // a command buffer's kernel commands and segment list (selector 12)
+    IODataQueueMemory *nq_memory = nullptr;
+    mach_port_t port = MACH_PORT_NULL;          // the notification queue's "data available" port
+    std::thread completions;
+    std::mutex lock;                            // around what follows
+    std::condition_variable finished;
+    std::map<uint64_t, uint32_t> done;          // completed tokens nobody has collected yet -> their status
+    std::set<uint64_t> given_up;                // tokens whose waiter stopped waiting (their answer is dropped)
+    uint64_t next_seq = 1;
+    unsigned outstanding = 0;                   // submitted, completion not seen
+    bool stopping = false;
+
+    bool open(io_service_t service);            // false with the reason (fail)
+    void close();
+    bool newMemory(Bo &bo, uint64_t size, bool gpu_read_only);
+    bool newSurface(Bo &bo, unsigned surface, uint64_t size);
+    void freeMemory(Bo &bo);
+    bool newHeap(uint32_t chunk_size, uint32_t initial, uint32_t most, uint32_t in_flight, uint32_t &handle,
+                 uint64_t &ctx, uint64_t &first);
+    void freeHeap(uint32_t handle);
+    bool submit(uint64_t stream_va, uint32_t bytes, uint64_t &token);  // token: the "completed" one to wait for
+    int wait(uint64_t token, int64_t timeout_ms, uint32_t &status);    // 0 (status set), -1 not in time
+
+private:
+    bool sysMemory(uint64_t size, bool gpu_read_only, uint32_t &id, uint64_t &gpu, uint64_t &cpu);
+    void deleteResource(uint32_t id);
+    void run();
+};
+
 struct hakios_metal_device {
-    io_connect_t connection = 0;
+    io_connect_t connection = 0;                // panthor's interface (type 0; beside IOGPU: the queries only)
+    IOGPUTransport iogpu;                       // Apple's IOGPU interface, when metal_iogpu=1 (iogpu.conn != 0)
     uint64_t gpu_id = 0, shaders = 0, tiler = 0;
     uint32_t max_threads = 0, max_tasks = 0, core_range = 0;   // a core's threads and tasks; highest core id + 1
     Bo wls;                                     // threadgroup memory, grown as dispatches need
@@ -132,7 +191,7 @@ struct hakios_metal_device {
     Bo tls[12];
     std::vector<Bo> retired;                    // grown out of (a command buffer in flight may use one): freed at close
     uint32_t vm = 0, group = 0;
-    uint64_t next_va = 0x100000000ULL;          // our addresses: the lower half is the program's
+    uint64_t next_va = 0x100000000ULL;          // our addresses: the lower half is the program's (not used with IOGPU: its addresses are the task's)
     std::mutex lock;                            // around the service's calls and next_va
     Bo descriptors;                             // the blit shaders' code, their program descriptors, the local storage
     uint64_t spd[5] = {};
@@ -214,6 +273,13 @@ struct hakios_metal_device {
             }
         }
         pool_misses++;
+        if (iogpu.conn != 0) {
+            if (!iogpu.newMemory(bo, c.size, bind_flags == BIND_READONLY)) {
+                return false;
+            }
+            bo.bind = bind_flags;
+            return true;
+        }
         if (call(BO_CREATE, &c, sizeof(c)) != 0) {
             fail("no GPU memory of %llu bytes", (unsigned long long)size);
             return false;
@@ -293,6 +359,9 @@ struct hakios_metal_device {
         }
         struct { uint32_t surface, handle; uint64_t size; uint32_t offset, row_bytes, width, height, format, planes; } r = {};
         r.surface = id;
+        if (iogpu.conn != 0) {
+            r.handle = 0xffffffffu;             // (the description only: the memory comes as an IOGPU resource)
+        }
         int e = call(0x7e, &r, sizeof(r));
         if (e != 0) {
             fail("IOSurface %u could not be had as GPU memory (HakiosGPU: 0x%x)", id, e);
@@ -300,7 +369,11 @@ struct hakios_metal_device {
         }
         Surface sf = {};
         sf.info = { r.size, r.offset, r.row_bytes, r.width, r.height, r.format, r.planes };
-        if (!mapAndBind(sf.bo, r.handle, r.size, BIND_NOEXEC)) {
+        if (iogpu.conn != 0) {
+            if (!iogpu.newSurface(sf.bo, id, r.size)) {
+                return false;
+            }
+        } else if (!mapAndBind(sf.bo, r.handle, r.size, BIND_NOEXEC)) {
             gem_close gc = { r.handle, 0 };
             call(GEM_CLOSE, &gc, sizeof(gc));
             return false;
@@ -428,6 +501,11 @@ struct hakios_metal_device {
 
     void freeBoNow(Bo &bo)                              // (lock held)
     {
+        if (iogpu.conn != 0) {
+            iogpu.freeMemory(bo);                           // (out of the GPU's address space before the memory goes)
+            bo = Bo();
+            return;
+        }
         bind_op op = {};
         op.flags = BIND_UNMAP;
         op.va = bo.va;
@@ -1124,6 +1202,7 @@ struct hakios_metal_cb {
     unsigned seq = 0;                           // (boot-arg metal_glitchwatch: its number, in commit order)
     Bo stream;
     uint32_t sync = 0;
+    uint64_t token = 0;             // (IOGPU) the "completed" token its submission is answered with; 0: nothing submitted
     void (*callback)(hakios_metal_cb *, void *) = nullptr;
     void *context = nullptr;
     bool freed = false;             // freed by its owner while in flight: the queue's thread frees it after
@@ -1187,23 +1266,39 @@ struct hakios_metal_queue {
                 pending.pop_front();
             }
             if (cb->status != HAKIOS_METAL_ERROR) {
-                syncobj_wait w = {};
-                w.handles = (uint64_t)(uintptr_t)&cb->sync;
-                w.timeout_nsec = 10000000000LL;         // relative (HakiosGPU's convention)
-                w.count_handles = 1;
-                w.flags = 1;
-                // (WITHOUT the device's lock, 11-10: it guards the device's buffers and addresses, not the call -- held
-                // here, every other call waited for the GPU to finish this command buffer: the next one's submission in
-                // commit, and HakiosGPU's surface marks at a command buffer's first draw, so CoreAnimation recorded its
-                // frames one GPU completion at a time; the kernel drops its own lock while it waits)
-                int r = device->call(SYNCOBJ_WAIT, &w, sizeof(w));
+                int r;
+                bool lost;                      // the queue restarted after a GPU fault with this work not done
+                uint32_t iogpu_status = 0;      // (IOGPU) the completion's status: 0 done, 0xb a page fault, 1/0xa not run
+                if (device->iogpu.conn != 0) {
+                    // (IOGPU: the device's completion thread hands the "completed" answer over; nothing submitted for an
+                    // empty command buffer -- done in its turn, as the signalled sync object was)
+                    r = cb->token == 0 ? 0 : device->iogpu.wait(cb->token, 10000, iogpu_status);
+                    lost = r == 0 && iogpu_status == 0xb;
+                } else {
+                    syncobj_wait w = {};
+                    w.handles = (uint64_t)(uintptr_t)&cb->sync;
+                    w.timeout_nsec = 10000000000LL;         // relative (HakiosGPU's convention)
+                    w.count_handles = 1;
+                    w.flags = 1;
+                    // (WITHOUT the device's lock, 11-10: it guards the device's buffers and addresses, not the call -- held
+                    // here, every other call waited for the GPU to finish this command buffer: the next one's submission in
+                    // commit, and HakiosGPU's surface marks at a command buffer's first draw, so CoreAnimation recorded its
+                    // frames one GPU completion at a time; the kernel drops its own lock while it waits)
+                    r = device->call(SYNCOBJ_WAIT, &w, sizeof(w));
+                    lost = r == 0 && w.pad != 0;    // (HakiosGPU's: the queue was restarted after a GPU fault)
+                }
                 cb->waited_at = std::chrono::steady_clock::now();
                 std::lock_guard<std::mutex> g(cb->lock);
                 if (r != 0) {
                     cb->error = "the GPU did not finish the command buffer in 10 s";
                     cb->status = HAKIOS_METAL_ERROR;
-                } else if (w.pad != 0) {
-                    // (HakiosGPU's: the queue was restarted after a GPU fault with this submission not done)
+                } else if (!lost && iogpu_status != 0) {
+                    char why[128];
+                    snprintf(why, sizeof(why), "IOGPU did not run the command buffer (status 0x%x: %s)", iogpu_status,
+                        iogpu_status == 0xa ? "the GPU's queue refused the stream" : "its queue went before it ran");
+                    cb->error = why;
+                    cb->status = HAKIOS_METAL_ERROR;
+                } else if (lost) {
                     cb->error = "a GPU fault: the command buffer's work is lost (the queue was restarted)";
                     cb->status = HAKIOS_METAL_ERROR;
                     // (11-23) what the lost command buffer read: each draw's program, its target, its textures' memory and

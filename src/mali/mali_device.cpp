@@ -24,7 +24,12 @@ openDraws(hakios_metal_device *d)
         prog != nullptr && strcmp(prog, "backboardd") == 0 ? 5 : 1;
     struct { uint32_t vm_id, initial, chunk_size, max_chunks, in_flight, handle; uint64_t ctx, first; } th =
         { d->vm, first_chunks, 2u << 20, max_chunks, 65535, 0, 0, 0 };
-    if (d->call(0x4b /* TILER_HEAP_CREATE */, &th, sizeof(th)) != 0) {
+    if (d->iogpu.conn != 0) {
+        // (IOGPU: the Mali's selector 56, in the client's one address space -- the same heap, other arguments' order)
+        if (!d->iogpu.newHeap(th.chunk_size, th.initial, th.max_chunks, th.in_flight, th.handle, th.ctx, th.first)) {
+            return false;
+        }
+    } else if (d->call(0x4b /* TILER_HEAP_CREATE */, &th, sizeof(th)) != 0) {
         fail("HakiosGPU: no tiler heap (hakios-kernel with heaps, 11-05 or later)");
         return false;
     }
@@ -135,12 +140,25 @@ hakios_metal_open(void)
         fail("HakiosGPU could not be opened");
         return nullptr;
     }
+    // boot-arg metal_iogpu=1: buffers, the queue and the heap through Apple's IOGPU interface (type 1; see
+    // IOGPUTransport). Not there (an older kernel): said, and panthor's interface as before.
+    static const bool want_iogpu = bootArg("metal_iogpu=1");
+    if (want_iogpu) {
+        if (d->iogpu.open(service)) {
+            fprintf(stderr, "metal-iogpu: %s: buffers, queue and heap through IOGPU (metal_iogpu=1)\n", getprogname());
+        } else {
+            fprintf(stderr, "metal-iogpu: %s: IOGPU could not be opened (%s): panthor's interface instead\n",
+                getprogname(), gError.c_str());
+        }
+    }
     IOObjectRelease(service);
     gpu_info info = {};
     dev_query q = { 0, sizeof(info), (uint64_t)(uintptr_t)&info };
     vm_create vc = {};
     vc.user_va_range = 1ULL << 47;
-    if (d->call(DEV_QUERY, &q, sizeof(q)) != 0 || d->call(VM_CREATE, &vc, sizeof(vc)) != 0) {
+    // (IOGPU: DEV_QUERY only, on the type-0 connection -- the type-1 interface has no description of the Mali yet;
+    // the address space is the IOGPU client's, made by the kernel)
+    if (d->call(DEV_QUERY, &q, sizeof(q)) != 0 || (d->iogpu.conn == 0 && d->call(VM_CREATE, &vc, sizeof(vc)) != 0)) {
         fail("HakiosGPU: no description or no VM");
         hakios_metal_close(d);
         return nullptr;
@@ -196,6 +214,9 @@ hakios_metal_open(void)
     gc.vm_id = d->vm;
     d->tiler_levels = (info.tiler_features >> 8) & 0xf;
     openDraws(d);                                       // (without it, draws are refused by name)
+    if (d->iogpu.conn != 0) {
+        return d;                                       // (IOGPU: the command queue made at the open is the group)
+    }
     if (d->call(GROUP_CREATE, &gc, sizeof(gc)) != 0) {
         fail("HakiosGPU: no group");
         hakios_metal_close(d);
@@ -238,13 +259,18 @@ hakios_metal_close(hakios_metal_device *d)
     d->freeBo(d->heapdesc);
     if (d->heap_handle != 0) {
         struct { uint32_t handle, pad; } td = { d->heap_handle, 0 };
-        d->call(0x4c /* TILER_HEAP_DESTROY */, &td, sizeof(td));
+        if (d->iogpu.conn != 0) {
+            d->iogpu.freeHeap(d->heap_handle);
+        } else {
+            d->call(0x4c /* TILER_HEAP_DESTROY */, &td, sizeof(td));
+        }
     }
     d->freeBo(d->wls);
     for (Bo &b : d->tls) d->freeBo(b);
     for (Bo &b : d->retired) {
         d->freeBo(b);
     }
+    d->iogpu.close();                                   // (what is still held there goes with the connection, as on type 0)
     if (d->connection) {
         IOServiceClose(d->connection);
     }
@@ -760,8 +786,18 @@ hakios_metal_cb_commit(hakios_metal_cb *cb, void (*callback)(hakios_metal_cb *cb
             sync_op signal = {};
             queue_submit qs = {};
             group_submit gs = {};
-            std::lock_guard<std::mutex> g(d->lock);
-            if (d->call(SYNCOBJ_CREATE, &sc, sizeof(sc)) != 0) {
+            std::lock_guard<std::mutex> g(d->lock);     // (submissions in commit order, both ways)
+            if (d->iogpu.conn != 0) {
+                // (IOGPU: trap 0 with the stream's address and length; the kernel CALLs it from the queue's ring)
+                bool submitted = d->iogpu.submit(cb->stream.va, n * 8, cb->token);
+                cb->submitted_at = std::chrono::steady_clock::now();
+                if (!submitted) {
+                    cb->error = "IOGPU did not take the submission";
+                    cb->status = HAKIOS_METAL_ERROR;
+                } else {
+                    cb->status = HAKIOS_METAL_SCHEDULED;
+                }
+            } else if (d->call(SYNCOBJ_CREATE, &sc, sizeof(sc)) != 0) {
                 cb->error = "no sync object";
                 cb->status = HAKIOS_METAL_ERROR;
             } else {
@@ -787,7 +823,10 @@ hakios_metal_cb_commit(hakios_metal_cb *cb, void (*callback)(hakios_metal_cb *cb
         syncobj_create sc = {};
         sc.flags = 1;           // signalled
         std::lock_guard<std::mutex> g(d->lock);
-        if (d->call(SYNCOBJ_CREATE, &sc, sizeof(sc)) == 0) {
+        if (d->iogpu.conn != 0) {
+            cb->token = 0;      // (IOGPU: nothing to submit or wait for)
+            cb->status = HAKIOS_METAL_SCHEDULED;
+        } else if (d->call(SYNCOBJ_CREATE, &sc, sizeof(sc)) == 0) {
             cb->sync = sc.handle;
             cb->status = HAKIOS_METAL_SCHEDULED;
         } else {
