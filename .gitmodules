@@ -10,3 +10,6 @@
 [submodule "userland"]
 	path = userland
 	url = https://github.com/Project-AkIOS/userland.git
+[submodule "metal"]
+	path = metal
+	url = https://github.com/Project-AkIOS/metal.git
