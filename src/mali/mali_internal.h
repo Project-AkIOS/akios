@@ -116,6 +116,7 @@ struct Bo {
     void *cpu = nullptr;
     bool driver_mapped = false;         // mapped by HakiosGPU (0x7c): undone by GEM_CLOSE, not by IOConnectUnmapMemory64
     uint32_t bind = ~0u;                // newBo's bind flags (~0: not newBo's -- a surface's: never kept in the pool)
+    void *ext = nullptr;                // (hakios_metal_open_iogpu) the caller's cookie for the memory, given back to ops->free
 };
 
 /*
@@ -177,6 +178,14 @@ private:
 struct hakios_metal_device {
     io_connect_t connection = 0;                // panthor's interface (type 0; beside IOGPU: the queries only)
     IOGPUTransport iogpu;                       // Apple's IOGPU interface, when metal_iogpu=1 (iogpu.conn != 0)
+    // OVER IOGPU.FRAMEWORK (hakios_metal_open_iogpu, mali_external.cpp): the plug-in's IOGPUMetalDevice owns the
+    // connection, the queues and the submission; every piece of memory the core needs comes from the caller's ops (an
+    // IOGPU resource on that connection: the one GPU address space the streams run in); nothing here opens the
+    // service, and connection and iogpu stay unused (0)
+    bool external = false;
+    io_connect_t shared_conn = 0;               // IOGPU.framework's connection: the Mali's vendor selectors only
+    hakios_metal_memory_ops ext_ops = {};
+    hakios_metal_queue *ext_queue = nullptr;    // what every external command buffer names as its queue (no thread)
     uint64_t gpu_id = 0, shaders = 0, tiler = 0;
     uint32_t max_threads = 0, max_tasks = 0, core_range = 0;   // a core's threads and tasks; highest core id + 1
     Bo wls;                                     // threadgroup memory, grown as dispatches need
@@ -257,6 +266,40 @@ struct hakios_metal_device {
         pool.resize(keep);
     }
 
+    // (external) SIZE bytes from the caller's ops (lock held); no allocation of 4 GB or less across a 4 GB boundary (a
+    // local storage descriptor's address must not carry over 32 bits): one that does is made again at twice the size
+    // and the piece on one side of the boundary used, as IOGPUTransport::newMemory does
+    bool extAlloc(Bo &bo, uint64_t size, uint32_t bind_flags)
+    {
+        hakios_metal_memory m = {};
+        uint32_t flags = bind_flags == BIND_READONLY ? HAKIOS_METAL_MEMORY_GPU_READ_ONLY : 0;
+        if (ext_ops.alloc == nullptr || ext_ops.alloc(ext_ops.context, size, flags, &m) != 0 || m.gpu_va == 0 || m.cpu == nullptr) {
+            if (m.cookie != nullptr) ext_ops.free(ext_ops.context, m.cookie);
+            fail("no GPU memory of %llu bytes (the plug-in's IOGPU resources)", (unsigned long long)size);
+            return false;
+        }
+        uint64_t skip = 0;
+        if (size <= (1ULL << 32) && m.gpu_va >> 32 != (m.gpu_va + size - 1) >> 32) {
+            ext_ops.free(ext_ops.context, m.cookie);
+            m = {};
+            if (ext_ops.alloc(ext_ops.context, size * 2, flags, &m) != 0 || m.gpu_va == 0 || m.cpu == nullptr) {
+                if (m.cookie != nullptr) ext_ops.free(ext_ops.context, m.cookie);
+                fail("no GPU memory of %llu bytes (the plug-in's IOGPU resources)", (unsigned long long)size * 2);
+                return false;
+            }
+            if (m.gpu_va >> 32 != (m.gpu_va + size - 1) >> 32) {
+                skip = ((m.gpu_va + size - 1) & ~0xffffffffULL) - m.gpu_va;
+            }
+        }
+        bo = Bo();
+        bo.handle = m.resource_id != 0 ? m.resource_id : 1;     // (non-zero: the memory is the device's to give back)
+        bo.size = size;
+        bo.va = m.gpu_va + skip;
+        bo.cpu = (uint8_t *)m.cpu + skip;
+        bo.ext = m.cookie;
+        return true;
+    }
+
     bool newBo(Bo &bo, uint64_t size, uint32_t bind_flags)
     {
         std::lock_guard<std::mutex> g(lock);
@@ -273,6 +316,13 @@ struct hakios_metal_device {
             }
         }
         pool_misses++;
+        if (external) {
+            if (!extAlloc(bo, c.size, bind_flags)) {
+                return false;
+            }
+            bo.bind = bind_flags;
+            return true;
+        }
         if (iogpu.conn != 0) {
             if (!iogpu.newMemory(bo, c.size, bind_flags == BIND_READONLY)) {
                 return false;
@@ -456,7 +506,7 @@ struct hakios_metal_device {
     {
         static const bool off = bootArg("metal_nobufpool");
         std::lock_guard<std::mutex> g(lock);
-        if (off || bo.handle == 0 || bo.cpu == nullptr || bo.size > 256 * 1024 || buffer_pool.size() >= 384 ||
+        if (off || external || bo.handle == 0 || bo.cpu == nullptr || bo.size > 256 * 1024 || buffer_pool.size() >= 384 ||
             buffer_pool_bytes + bo.size > (24ULL << 20)) {
             return false;
         }
@@ -473,6 +523,10 @@ struct hakios_metal_device {
             return;
         }
         static const bool pooling = !bootArg("metal_bopool=0");
+        if (external) {
+            freeBoNow(bo);                                  // (IOGPU resources: no pool of ours -- plan 2.1)
+            return;
+        }
         auto now = std::chrono::steady_clock::now();
         poolTrim(now);
         if (pooling && bo.bind == BIND_NOEXEC && bo.cpu != nullptr && bo.size <= kPoolMostEach && pool_bytes + bo.size <= kPoolMost) {
@@ -501,6 +555,14 @@ struct hakios_metal_device {
 
     void freeBoNow(Bo &bo)                              // (lock held)
     {
+        if (external) {
+            // (the kernel frees a deleted resource only after the client's earlier submissions have completed)
+            if (bo.ext != nullptr && ext_ops.free != nullptr) {
+                ext_ops.free(ext_ops.context, bo.ext);
+            }
+            bo = Bo();
+            return;
+        }
         if (iogpu.conn != 0) {
             iogpu.freeMemory(bo);                           // (out of the GPU's address space before the memory goes)
             bo = Bo();
@@ -1399,6 +1461,11 @@ struct hakios_metal_queue {
 };
 namespace mali {
 bool openDraws(hakios_metal_device *d);
+bool openBlits(hakios_metal_device *d);         // the blit shaders' code and descriptors (mali_device.cpp)
+// (external) the Mali's tiler heap through vendor selectors 56/57 on the shared IOGPU connection (mali_external.cpp)
+bool extNewHeap(hakios_metal_device *d, uint32_t chunk_size, uint32_t initial, uint32_t most, uint32_t in_flight,
+    uint32_t &handle, uint64_t &ctx, uint64_t &first);
+void extFreeHeap(hakios_metal_device *d, uint32_t handle);
 }  // namespace mali
 using namespace mali;   // (it was an anonymous namespace: its names are seen outside it)
 extern "C" {
@@ -1407,6 +1474,8 @@ extern "C++" io_service_t find_gpu_service(void);
 
 extern "C++" void mirrorsBack(hakios_metal_cb *cb, hakios_metal_device *d);
 extern "C++" void passElide(hakios_metal_cb *cb);
+// a command buffer's stream built into a stream buffer of the device (N its words); false with cb's error set
+extern "C++" bool emitStream(hakios_metal_cb *cb, hakios_metal_device *d, unsigned &n);
 extern "C++" void zsKeep(hakios_metal_cb *cb);
 extern "C++" { namespace mali {
 void markBusy(hakios_metal_cb *cb, hakios_metal_device *d, hakios_metal_texture *t);

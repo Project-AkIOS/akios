@@ -605,6 +605,79 @@ const char *hakios_metal_cb_error(hakios_metal_cb *cb);
 /* how long the GPU had it, in nanoseconds (commit to fence), once completed */
 int64_t hakios_metal_cb_gpu_nanoseconds(hakios_metal_cb *cb);
 
+/*
+ * OVER IOGPU.FRAMEWORK (AkIOS's AkiosMetal plug-in, phase 6 of ref/iogpu-research/phase6-plan.md; the Mali build's).
+ * The plug-in's device is an IOGPUMetalDevice: IOGPU.framework opens the accelerator, makes the queues, submits and
+ * completes. The core then only records and builds: it opens nothing of its own, every piece of memory it needs (blit
+ * shaders, kernels' code, streams, spill space, the heap's descriptor, staging) comes from OPS -- the plug-in's IOGPU
+ * resources on the same connection, the one GPU address space the streams run in (the kernel gives each IOGPU
+ * connection its own) -- and the plug-in's buffers and textures are wrapped, not allocated. Nothing here touches the
+ * other entry points: hakios_metal_open() and its devices work as before.
+ */
+struct hakios_metal_memory {
+	uint64_t gpu_va;                /* the GPU's address, which is also where the CPU sees it */
+	void *cpu;                      /* the CPU's mapping (never NULL for what alloc gives) */
+	uint32_t resource_id;           /* the IOGPU resource's id (0: not known) */
+	void *cookie;                   /* handed back to free */
+};
+#define HAKIOS_METAL_MEMORY_GPU_READ_ONLY 1u   /* the GPU only reads it (code, descriptors): a hint */
+struct hakios_metal_memory_ops {
+	void *context;
+	/* SIZE bytes (zeroed), FLAGS HAKIOS_METAL_MEMORY_*; 0 and OUT filled, or -1. May be called from any thread. */
+	int (*alloc)(void *context, uint64_t size, uint32_t flags, struct hakios_metal_memory *out);
+	/* what alloc gave, given back (the kernel frees it once the work submitted before has completed) */
+	void (*free)(void *context, void *cookie);
+};
+#if defined(__APPLE__)
+#include <IOKit/IOTypes.h>
+/* A device over IOGPU.framework's connection CONN (IOGPUDeviceGetConnect of the plug-in's device): its description from
+ * the accelerator service's registry properties ("gpu-id", "shader-present", ...), the tiler heap through the Mali's
+ * vendor selectors 56/57 on CONN. OPS is copied. NULL with the reason. hakios_metal_close() closes it (CONN stays open). */
+hakios_metal_device *hakios_metal_open_iogpu(io_connect_t conn, const struct hakios_metal_memory_ops *ops);
+#endif
+/* a buffer over memory that is not the core's (an IOGPU resource): LENGTH bytes at GPU_VA, CPU (may be NULL for memory
+ * the CPU does not see), RESOURCE_ID its id; hakios_metal_buffer_free() frees only this wrapper (and only when no
+ * command buffer holds it any more) */
+hakios_metal_buffer *hakios_metal_buffer_wrap(hakios_metal_device *device, uint64_t gpu_va, void *cpu, uint64_t length,
+    uint32_t resource_id);
+/* A texture's layout, before its memory exists: what hakios_metal_texture_plan was asked (Metal's numbers; DEPTH a 3D
+ * texture's slices or a layered texture's layers -- a cube's six faces, a cube array's 6 x arrayLength --, 1 otherwise)
+ * and its answer. The memory (SIZE bytes) is then made by the caller (IOGPUMetalTexture's initialiser with sysMemSize
+ * SIZE, sysMemRowBytes ROW_BYTES) and wrapped by hakios_metal_texture_wrap, which writes the levels' plane descriptors
+ * into it at PLANES_OFFSET. The same layout the core's own textures have (hakios_metal_texture_new_*). */
+struct hakios_metal_texture_layout {
+	unsigned type, pixel_format, width, height, depth, levels, samples, usage;     /* asked */
+	uint64_t size;                  /* bytes of memory, every level, layer, sample and stencil plane, the descriptors */
+	uint32_t row_bytes;             /* level 0's rows (64-byte aligned) */
+	unsigned level_count;           /* levels, as many as the chain has at most */
+	uint64_t level_offset[16];      /* each level's first row from the start of the memory */
+	uint32_t level_row_bytes[16];
+	unsigned layers;                /* 1, or a layered texture's */
+	uint64_t layer_stride;
+	uint64_t stencil_offset;        /* Depth32Float_Stencil8: level 0's stencil plane (0: none) */
+	uint32_t stencil_row_bytes;
+	uint64_t planes_offset;         /* the plane descriptors (0: none, one level of one layer) */
+	unsigned samples_made;          /* the samples the texture has (2 is made as 4) */
+};
+/* 0 and LAYOUT filled, or -1 with the reason (a format, type, size or count not served) */
+int hakios_metal_texture_plan(hakios_metal_device *device, unsigned type, unsigned pixel_format, unsigned width, unsigned height,
+    unsigned depth, unsigned levels, unsigned samples, unsigned usage, struct hakios_metal_texture_layout *layout);
+/* a texture of LAYOUT over LAYOUT->size bytes at GPU_VA / CPU (both needed: the descriptors are written through CPU);
+ * hakios_metal_texture_free() frees only the wrapper. NULL with the reason. */
+hakios_metal_texture *hakios_metal_texture_wrap(hakios_metal_device *device, const struct hakios_metal_texture_layout *layout,
+    uint64_t gpu_va, void *cpu);
+/* Command buffers of a device over IOGPU: recorded as any other (copy, fill, blit, dispatch...), then
+ *   _build    everything up to the stream, written into memory from OPS: *VA and *LENGTH (bytes) what the GPU is to run,
+ *             LENGTH 0 when nothing was recorded; -1 (and LENGTH 0) when the command buffer failed already -- its error
+ *             is hakios_metal_cb_error(). Nothing is submitted: the plug-in puts VA and LENGTH into IOGPU's arguments.
+ *   _retire   once IOGPU says it completed: IOGPU_STATUS its status (0 done, 0xb a GPU page fault, anything else not run
+ *             or not finished); what it held is let go, the stream buffer goes back. Returns the final status, with
+ *             hakios_metal_cb_error() saying why for HAKIOS_METAL_ERROR.
+ * hakios_metal_cb_free() frees it (after _retire, or never committed). No callbacks, no queue thread, no _wait. */
+hakios_metal_cb *hakios_metal_cb_new_external(hakios_metal_device *device);
+int hakios_metal_cb_build(hakios_metal_cb *cb, uint64_t *va, uint32_t *length);
+enum hakios_metal_status hakios_metal_cb_retire(hakios_metal_cb *cb, uint32_t iogpu_status);
+
 #ifdef __cplusplus
 }
 #endif

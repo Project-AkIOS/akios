@@ -24,7 +24,12 @@ openDraws(hakios_metal_device *d)
         prog != nullptr && strcmp(prog, "backboardd") == 0 ? 5 : 1;
     struct { uint32_t vm_id, initial, chunk_size, max_chunks, in_flight, handle; uint64_t ctx, first; } th =
         { d->vm, first_chunks, 2u << 20, max_chunks, 65535, 0, 0, 0 };
-    if (d->iogpu.conn != 0) {
+    if (d->external) {
+        // (over IOGPU.framework: selector 56 on its connection -- the heap in the address space the streams run in)
+        if (!extNewHeap(d, th.chunk_size, th.initial, th.max_chunks, th.in_flight, th.handle, th.ctx, th.first)) {
+            return false;
+        }
+    } else if (d->iogpu.conn != 0) {
         // (IOGPU: the Mali's selector 56, in the client's one address space -- the same heap, other arguments' order)
         if (!d->iogpu.newHeap(th.chunk_size, th.initial, th.max_chunks, th.in_flight, th.handle, th.ctx, th.first)) {
             return false;
@@ -62,6 +67,40 @@ openDraws(hakios_metal_device *d)
     zs[0] = 7 | 7 << 4 | 7 << 16;                       // stencil faces: always
     zs[4] = 1u << 21 | 1u << 22 | 1u << 23 | 2u << 25 | 7u << 29;   // depth: always, nothing written (zsOf's word 4)
     d->heap_ok = true;
+    return true;
+}
+
+// the blit shaders (code read only and executable), their program descriptors and the local storage; false with the reason
+bool
+openBlits(hakios_metal_device *d)
+{
+    if (!d->newBo(d->descriptors, 0x4000, BIND_READONLY)) {
+        return false;
+    }
+    const mali_blit_shader *shaders[4] = { &mali_copy_u32, &mali_fill_u32, &mali_copy_u8, &mali_fill_u8 };
+    auto *bytes = (uint8_t *)d->descriptors.cpu;
+    for (unsigned i = 0; i < 4; i++) {
+        memcpy(bytes + 0x200 * i, shaders[i]->code, shaders[i]->size);     // code at 0x000, 0x200, 0x400, 0x600
+        auto *spd = (uint32_t *)(bytes + 0x1000 + 0x40 * i);                // program descriptors from 0x1000
+        spd[0] = 8 | 1 << 4 | (shaders[i]->work_regs <= 32 ? 2u : 0u) << 30;
+        spd[1] = (uint32_t)(shaders[i]->preload >> 48);
+        spd[2] = (uint32_t)(d->descriptors.va + 0x200 * i);
+        spd[3] = (uint32_t)((d->descriptors.va + 0x200 * i) >> 32);
+        d->spd[i] = d->descriptors.va + 0x1000 + 0x40 * i;
+    }
+    {
+        // copy_rows_u32 (COPY_ROWS): its code at 0x800 (up to 2 KiB), its program descriptor at 0x1100
+        const mali_blit_shader *r = &mali_copy_rows_u32;
+        memcpy(bytes + 0x800, r->code, r->size);
+        auto *spd = (uint32_t *)(bytes + 0x1100);
+        spd[0] = 8 | 1 << 4 | (r->work_regs <= 32 ? 2u : 0u) << 30;
+        spd[1] = (uint32_t)(r->preload >> 48);
+        spd[2] = (uint32_t)(d->descriptors.va + 0x800);
+        spd[3] = (uint32_t)((d->descriptors.va + 0x800) >> 32);
+        d->spd[4] = d->descriptors.va + 0x1100;
+    }
+    ((uint32_t *)(bytes + 0x1200))[1] = 31;                                 // local storage: no workgroup memory
+    __asm__ volatile("dsb sy" ::: "memory");
     return true;
 }
 }  // namespace mali
@@ -171,35 +210,10 @@ hakios_metal_open(void)
     for (d->core_range = 64; d->core_range > 0 && !(info.shader_present >> (d->core_range - 1) & 1); d->core_range--) {
     }
     d->vm = vc.id;
-    // the blit shaders (code read only and executable), their program descriptors and the local storage
-    if (!d->newBo(d->descriptors, 0x4000, BIND_READONLY)) {
+    if (!openBlits(d)) {
         hakios_metal_close(d);
         return nullptr;
     }
-    const mali_blit_shader *shaders[4] = { &mali_copy_u32, &mali_fill_u32, &mali_copy_u8, &mali_fill_u8 };
-    auto *bytes = (uint8_t *)d->descriptors.cpu;
-    for (unsigned i = 0; i < 4; i++) {
-        memcpy(bytes + 0x200 * i, shaders[i]->code, shaders[i]->size);     // code at 0x000, 0x200, 0x400, 0x600
-        auto *spd = (uint32_t *)(bytes + 0x1000 + 0x40 * i);                // program descriptors from 0x1000
-        spd[0] = 8 | 1 << 4 | (shaders[i]->work_regs <= 32 ? 2u : 0u) << 30;
-        spd[1] = (uint32_t)(shaders[i]->preload >> 48);
-        spd[2] = (uint32_t)(d->descriptors.va + 0x200 * i);
-        spd[3] = (uint32_t)((d->descriptors.va + 0x200 * i) >> 32);
-        d->spd[i] = d->descriptors.va + 0x1000 + 0x40 * i;
-    }
-    {
-        // copy_rows_u32 (COPY_ROWS): its code at 0x800 (up to 2 KiB), its program descriptor at 0x1100
-        const mali_blit_shader *r = &mali_copy_rows_u32;
-        memcpy(bytes + 0x800, r->code, r->size);
-        auto *spd = (uint32_t *)(bytes + 0x1100);
-        spd[0] = 8 | 1 << 4 | (r->work_regs <= 32 ? 2u : 0u) << 30;
-        spd[1] = (uint32_t)(r->preload >> 48);
-        spd[2] = (uint32_t)(d->descriptors.va + 0x800);
-        spd[3] = (uint32_t)((d->descriptors.va + 0x800) >> 32);
-        d->spd[4] = d->descriptors.va + 0x1100;
-    }
-    ((uint32_t *)(bytes + 0x1200))[1] = 31;                                 // local storage: no workgroup memory
-    __asm__ volatile("dsb sy" ::: "memory");
     // one group with one queue
     queue_create qc = {};
     qc.priority = 1;
@@ -259,7 +273,9 @@ hakios_metal_close(hakios_metal_device *d)
     d->freeBo(d->heapdesc);
     if (d->heap_handle != 0) {
         struct { uint32_t handle, pad; } td = { d->heap_handle, 0 };
-        if (d->iogpu.conn != 0) {
+        if (d->external) {
+            extFreeHeap(d, d->heap_handle);
+        } else if (d->iogpu.conn != 0) {
             d->iogpu.freeHeap(d->heap_handle);
         } else {
             d->call(0x4c /* TILER_HEAP_DESTROY */, &td, sizeof(td));
@@ -274,6 +290,7 @@ hakios_metal_close(hakios_metal_device *d)
     if (d->connection) {
         IOServiceClose(d->connection);
     }
+    delete d->ext_queue;                                // (external: never had a thread)
     delete d;
 }
 
@@ -535,6 +552,243 @@ hakios_metal_cb_surfaces_written(hakios_metal_cb *cb, unsigned *out, unsigned ma
     return n < max ? n : max;
 }
 
+/*
+ * THE STREAM (split out of hakios_metal_cb_commit, 11-26, for hakios_metal_cb_build as well): every job's instructions,
+ * then their descriptors and push constants, in one stream buffer of the device; N the instructions' words. false with
+ * CB's error when there is no stream buffer.
+ */
+extern "C++" bool
+emitStream(hakios_metal_cb *cb, hakios_metal_device *d, unsigned &n)
+{
+    // the stream (from 0), then each job's push constants: 32 bytes for a blit, a kernel's fau_words for a dispatch
+    static const bool stats = bootArg("metal_stats") || bootArg("mdsay=");
+    size_t words = 18 + cb->blits.size() * 24 + cb->draws.size() * (DRAW_WORDS + (stats ? 4 : 0));   // (24: a compute job's 15, its flush's 3)
+    for (const DrawJob &dj : cb->draws) {
+        if (dj.layers > 1) words += 3 * dj.layers;                          // (a layered pass's fragment jobs)
+    }
+    if (stats && !cb->draws.empty() && cb->timestamps.size == 0) {
+        if (!d->newBo(cb->timestamps, ((cb->draws.size() * 16) + 0xfff) & ~0xfffULL, BIND_NOEXEC)) {
+            cb->timestamps.size = 0;
+        }
+    }
+    cb->timestamp_count = 0;
+    uint64_t fau_area = (words * 8 + 0xff) & ~0xffULL, fau_size = 0;
+    std::vector<uint64_t> fau_at(cb->blits.size()), ir_at(cb->blits.size(), 0);
+    for (size_t i = 0; i < cb->blits.size(); i++) {
+        fau_at[i] = fau_area + fau_size;
+        if (cb->blits[i].shader == DRAW) {
+            fau_size += (drawBytes(cb->draws[cb->blits[i].dst]) + 0x3f) & ~0x3fULL;
+            // a Mali pass's first draw: the pass's incremental rendering (emitIr) after its area
+            if (i == 0 || cb->blits[i - 1].shader != DRAW ||
+                !samePass(cb->draws[cb->blits[i - 1].dst], cb->draws[cb->blits[i].dst])) {
+                ir_at[i] = fau_area + fau_size;
+                fau_size += IR_BYTES;
+            }
+            continue;
+        }
+        // (a dispatch: its push constants, then its local storage descriptor, 64-byte aligned)
+        fau_size += cb->blits[i].shader == DISPATCH ? ((cb->blits[i].kernel->binary.fau_words * 4 + 0x3f) & ~0x3fULL) + 0x40
+                                                    : 0x40;
+        // (and its resource table: 6 entries, then the texture, sampler and image tables, and the planes)
+        if (cb->blits[i].shader == DISPATCH && (cb->blits[i].texture_count || cb->blits[i].sampler_count)) {
+            fau_size += 0x80 + (cb->blits[i].texture_count * 3 + cb->blits[i].sampler_count) * 32 + 0x40;
+        }
+    }
+    bool stream_ok = d->takeStream(cb->stream, fau_area + fau_size);
+    cb->bo_at = std::chrono::steady_clock::now();
+    if (!stream_ok) {
+        cb->error = gError;
+        cb->status = HAKIOS_METAL_ERROR;
+        return false;
+    }
+    auto *s = (uint64_t *)cb->stream.cpu;
+    n = 0;
+    s[n++] = set_state(0, 3);           // v11's scoreboards, as panvk sets them up
+    s[n++] = set_state(9, 0x8);
+    s[n++] = set_state(1, 0);
+    s[n++] = set_state(2, 1);
+    s[n++] = set_state(8, 0xf0);
+    // the GPU's caches made to see what the CPU wrote, and (at the end) to show the CPU what the GPU wrote, as
+    // gallium's panfrost ends a batch: L2 and load/store cleaned, the others (the tiler's, descriptors')
+    // invalidated. Without it a queue drew its first render pass only: later passes found the tiler heap and
+    // contexts as the GPU's caches held them.
+    s[n++] = move32(74, 0);
+    s[n++] = 36ULL << 56 | 74ULL << 40 | 2 << 8 | 1 << 4 | 1;          // FLUSH_CACHE2
+    s[n++] = WAIT_ALL;
+    if (!cb->draws.empty()) {
+        s[n++] = 34ULL << 56 | 0xf;                                     // REQ_RESOURCE: compute, fragment, tiler, IDVS
+        // the queue's tiler heap, once (external: in every stream with draws -- the plug-in's IOGPU queues are
+        // hardware queues of their own, which one flag of the device cannot tell apart)
+        if (d->external || !d->heap_set.exchange(true)) {
+            s[n++] = move48(0, d->heap_ctx);
+            s[n++] = 48ULL << 56;                                       // HEAP_SET
+        }
+    }
+    uint8_t *pass_area = nullptr;           // the open Mali pass's first draw (emitDraw), or none
+    uint64_t pass_va = 0;
+    uint8_t *pass_ir = nullptr;             // ... and its incremental rendering (emitIr)
+    uint64_t pass_ir_va = 0;
+    for (size_t i = 0; i < cb->blits.size(); i++) {
+        const Job &b = cb->blits[i];
+        auto *pc = (uint8_t *)cb->stream.cpu + fau_at[i];
+        if (b.shader == DRAW) {
+            const DrawJob &dj = cb->draws[b.dst];
+            bool first = pass_area == nullptr;
+            bool last = i + 1 >= cb->blits.size() || cb->blits[i + 1].shader != DRAW ||
+                !samePass(dj, cb->draws[cb->blits[i + 1].dst]);
+            if (first) {
+                pass_area = pc;
+                pass_va = cb->stream.va + fau_at[i];
+                pass_ir = ir_at[i] != 0 ? (uint8_t *)cb->stream.cpu + ir_at[i] : nullptr;
+                pass_ir_va = ir_at[i] != 0 ? cb->stream.va + ir_at[i] : 0;
+            }
+            // (metal_stats: STORE_STATE timestamp, opcode 40, into the command buffer's timestamps, r80:r81
+            // the address; after everything before it is done)
+            auto stamp = [&] {
+                if (cb->timestamps.size != 0 && (cb->timestamp_count + 1) * 8 <= cb->timestamps.size) {
+                    s[n++] = WAIT_ALL;
+                    s[n++] = move48(80, cb->timestamps.va + 8ULL * cb->timestamp_count++);
+                    s[n++] = 40ULL << 56 | 80ULL << 40 | 0ULL << 32;
+                }
+            };
+            if (first) stamp();
+            emitDraw(d, dj, pc, cb->stream.va + fau_at[i], s, n, first, last, pass_area, pass_va, pass_ir, pass_ir_va);
+            if (last) stamp();
+            cb->draw_areas.push_back(fau_at[i]);
+            if (last) {
+                pass_area = nullptr;
+            }
+            continue;
+        }
+        uint64_t fau_va = cb->stream.va + fau_at[i], spd;
+        unsigned fau_entries, size[3], groups[3];
+        uint64_t local_storage = d->descriptors.va + 0x1200;            // none
+        uint64_t resources = 0;
+        if (b.shader == DISPATCH) {
+            const mali_kernel_binary &k = b.kernel->binary;
+            auto *w = (uint32_t *)pc;
+            memset(pc, 0, k.fau_words * 4);
+            memcpy(pc, b.buffers, sizeof(b.buffers));                       // words 2n, 2n+1
+            for (int c = 0; c < 3; c++) {
+                w[MALI_KERNEL_WORKGROUP_WORD + c] = b.threads[c];
+                w[MALI_KERNEL_GROUPS_WORD + c] = b.groups[c];
+                w[MALI_KERNEL_GRID_WORD + c] = b.grid[c];
+            }
+            memcpy(w + MALI_KERNEL_RESERVED, k.consts, (k.fau_words - MALI_KERNEL_RESERVED) * 4);
+            if (k.tls_size != 0 || b.wls_size != 0) {
+                // the local storage descriptor (Mesa's genxml v10 "Local Storage"): spill space, packed, per thread
+                // 16 << word 0 bytes; threadgroup memory 2^(word 1 & 31) instances of 2^((word 1 >> 8) - 1) bytes
+                uint64_t at = (k.fau_words * 4 + 0x3f) & ~0x3fULL;
+                auto *ls = (uint32_t *)(pc + at);
+                memset(ls, 0, 32);
+                if (k.tls_size != 0) {
+                    ls[0] = log2u((k.tls_size + 15) / 16);
+                    ls[2] = (uint32_t)(d->tls[ls[0]].va >> 8);
+                    ls[3] = (uint32_t)(d->tls[ls[0]].va >> 40) | 1u << 28;
+                }
+                if (b.wls_size != 0) {
+                    ls[1] = log2u(b.wls_instances) | (log2u(b.wls_size) + 1) << 8;
+                    ls[4] = (uint32_t)d->wls.va;
+                    ls[5] = (uint32_t)(d->wls.va >> 32);
+                } else {
+                    ls[1] = 31;                                         // no threadgroup memory
+                }
+                local_storage = fau_va + at;
+            }
+            if (b.texture_count || b.sampler_count) {
+                // the resource table (r0): 16-byte entries, table t's descriptors at entry t (gallium's
+                // numbering: sampler 3, texture 4, image 5); each texture once in the texture table, once in the
+                // image table, its plane after them
+                uint64_t at = ((k.fau_words * 4 + 0x3f) & ~0x3fULL) + 0x40;
+                uint8_t *rt = pc + at;
+                uint64_t rt_va = fau_va + at, tex_va = rt_va + 0x80;
+                uint64_t samp_va = tex_va + b.texture_count * 32, img_va = samp_va + b.sampler_count * 32;
+                uint64_t plane_va = img_va + b.texture_count * 32;
+                memset(rt, 0, 0x80);
+                auto entry = [&](unsigned table, uint64_t va, unsigned count) {
+                    auto *e = (uint32_t *)(rt + 16 * table);
+                    e[0] = (uint32_t)va;
+                    e[1] = (uint32_t)(va >> 32) | 1u << 24;                 // contains descriptors
+                    e[2] = count * 32;
+                };
+                entry(MALI_TABLE_TEXTURE, tex_va, b.texture_count);
+                entry(MALI_TABLE_SAMPLER, samp_va, b.sampler_count);
+                entry(MALI_TABLE_IMAGE, img_va, b.texture_count);
+                for (unsigned t = 0; t < b.texture_count; t++) {
+                    auto *tex = (uint32_t *)(pc + (tex_va - fau_va) + 32 * t);
+                    auto *img = (uint32_t *)(pc + (img_va - fau_va) + 32 * t);
+                    uint32_t plane[8];
+                    if (b.textures[t] == nullptr) {
+                        memset(tex, 0, 32);
+                        memset(img, 0, 32);
+                        continue;
+                    }
+                    // (one plane, shared by the two descriptors; 32-byte aligned as everything here)
+                    uint64_t pva = plane_va;
+                    plane_va = pva + 32;
+                    describe(b.textures[t], tex, plane, pva);
+                    memcpy(pc + (pva - fau_va), plane, 32);
+                    memcpy(img, tex, 32);
+                }
+                for (unsigned t = 0; t < b.sampler_count; t++) {
+                    memcpy(pc + (samp_va - fau_va) + 32 * t, b.samplers[t], 32);
+                }
+                resources = rt_va | MALI_TABLES;
+            }
+            spd = b.kernel->spd;
+            fau_entries = (k.fau_words + 1) / 2;
+            memcpy(size, b.threads, sizeof(size));
+            memcpy(groups, b.groups, sizeof(groups));
+        } else {
+            memset(pc, 0, 32);
+            memcpy(pc + 0, &b.dst, 8);
+            memcpy(pc + 8, &b.src, 8);
+            memcpy(pc + 16, &b.value, 4);
+            memcpy(pc + 20, &b.count, 4);
+            if (b.shader == COPY_ROWS) {
+                memcpy(pc + 24, &b.src_stride, 4);
+                memcpy(pc + 28, &b.dst_stride, 4);
+                spd = d->spd[4];
+            } else {
+                spd = d->spd[b.shader];
+            }
+            fau_entries = 4;                                                // 8 words: 4 of 64 bits
+            size[0] = 64, size[1] = size[2] = 1;                            // 64 invocations a workgroup
+            groups[0] = (b.count + 63) / 64, groups[1] = groups[2] = 1;
+        }
+        // A COMPUTE JOB AFTER OTHER WORK OF THIS COMMAND BUFFER (11-10): the load/store caches cleaned and the
+        // texture caches dropped first, as a render pass now opens (pass_inv) -- a blit or kernel reading what a
+        // pass or another job just wrote (CoreAnimation's backdrop blurs copy what is drawn so far) could read a
+        // core's stale texture lines: the widgets page's and the App Library's blurred backgrounds came out
+        // empty or with noise for a frame (the tester's clips). Jobs were only ordered (WAIT_ALL).
+        if (i > 0) {
+            s[n++] = move32(74, 0);
+            s[n++] = 36ULL << 56 | 74ULL << 40 | 2 << 8 | 1 << 4;      // FLUSH_CACHE2: LSC clean, others invalidated
+            s[n++] = WAIT_ALL;
+        }
+        s[n++] = move48(16, spd);
+        s[n++] = move48(24, local_storage);
+        s[n++] = move48(8, fau_va);
+        s[n++] = move32(9, (uint32_t)(fau_va >> 32) | fau_entries << 24);
+        s[n++] = move48(0, resources);                                      // the resource table, or none
+        s[n++] = move32(32, 0);
+        s[n++] = move32(33, (size[0] - 1) | (size[1] - 1) << 10 | (size[2] - 1) << 20);
+        s[n++] = move32(34, 0);
+        s[n++] = move32(35, 0);
+        s[n++] = move32(36, 0);
+        s[n++] = move32(37, groups[0]);
+        s[n++] = move32(38, groups[1]);
+        s[n++] = move32(39, groups[2]);
+        s[n++] = RUN_COMPUTE;
+        s[n++] = WAIT_ALL;                                                  // in order, as Metal's encoders are
+    }
+    s[n++] = move32(74, 0);
+    s[n++] = 36ULL << 56 | 74ULL << 40 | 2 << 8 | 1 << 4 | 1;          // FLUSH_CACHE2, as at the start
+    s[n++] = WAIT_ALL;
+    __asm__ volatile("dsb sy" ::: "memory");
+    return true;
+}
+
 void
 hakios_metal_cb_commit(hakios_metal_cb *cb, void (*callback)(hakios_metal_cb *cb, void *context), void *context)
 {
@@ -559,229 +813,8 @@ hakios_metal_cb_commit(hakios_metal_cb *cb, void (*callback)(hakios_metal_cb *cb
     if (!cb->error.empty()) {
         cb->status = HAKIOS_METAL_ERROR;
     } else if (!cb->blits.empty()) {
-        // the stream (from 0), then each job's push constants: 32 bytes for a blit, a kernel's fau_words for a dispatch
-        static const bool stats = bootArg("metal_stats") || bootArg("mdsay=");
-        size_t words = 18 + cb->blits.size() * 24 + cb->draws.size() * (DRAW_WORDS + (stats ? 4 : 0));   // (24: a compute job's 15, its flush's 3)
-        for (const DrawJob &dj : cb->draws) {
-            if (dj.layers > 1) words += 3 * dj.layers;                          // (a layered pass's fragment jobs)
-        }
-        if (stats && !cb->draws.empty() && cb->timestamps.size == 0) {
-            if (!d->newBo(cb->timestamps, ((cb->draws.size() * 16) + 0xfff) & ~0xfffULL, BIND_NOEXEC)) {
-                cb->timestamps.size = 0;
-            }
-        }
-        cb->timestamp_count = 0;
-        uint64_t fau_area = (words * 8 + 0xff) & ~0xffULL, fau_size = 0;
-        std::vector<uint64_t> fau_at(cb->blits.size()), ir_at(cb->blits.size(), 0);
-        for (size_t i = 0; i < cb->blits.size(); i++) {
-            fau_at[i] = fau_area + fau_size;
-            if (cb->blits[i].shader == DRAW) {
-                fau_size += (drawBytes(cb->draws[cb->blits[i].dst]) + 0x3f) & ~0x3fULL;
-                // a Mali pass's first draw: the pass's incremental rendering (emitIr) after its area
-                if (i == 0 || cb->blits[i - 1].shader != DRAW ||
-                    !samePass(cb->draws[cb->blits[i - 1].dst], cb->draws[cb->blits[i].dst])) {
-                    ir_at[i] = fau_area + fau_size;
-                    fau_size += IR_BYTES;
-                }
-                continue;
-            }
-            // (a dispatch: its push constants, then its local storage descriptor, 64-byte aligned)
-            fau_size += cb->blits[i].shader == DISPATCH ? ((cb->blits[i].kernel->binary.fau_words * 4 + 0x3f) & ~0x3fULL) + 0x40
-                                                        : 0x40;
-            // (and its resource table: 6 entries, then the texture, sampler and image tables, and the planes)
-            if (cb->blits[i].shader == DISPATCH && (cb->blits[i].texture_count || cb->blits[i].sampler_count)) {
-                fau_size += 0x80 + (cb->blits[i].texture_count * 3 + cb->blits[i].sampler_count) * 32 + 0x40;
-            }
-        }
-        bool stream_ok = d->takeStream(cb->stream, fau_area + fau_size);
-        cb->bo_at = std::chrono::steady_clock::now();
-        if (!stream_ok) {
-            cb->error = gError;
-            cb->status = HAKIOS_METAL_ERROR;
-        } else {
-            auto *s = (uint64_t *)cb->stream.cpu;
-            unsigned n = 0;
-            s[n++] = set_state(0, 3);           // v11's scoreboards, as panvk sets them up
-            s[n++] = set_state(9, 0x8);
-            s[n++] = set_state(1, 0);
-            s[n++] = set_state(2, 1);
-            s[n++] = set_state(8, 0xf0);
-            // the GPU's caches made to see what the CPU wrote, and (at the end) to show the CPU what the GPU wrote, as
-            // gallium's panfrost ends a batch: L2 and load/store cleaned, the others (the tiler's, descriptors')
-            // invalidated. Without it a queue drew its first render pass only: later passes found the tiler heap and
-            // contexts as the GPU's caches held them.
-            s[n++] = move32(74, 0);
-            s[n++] = 36ULL << 56 | 74ULL << 40 | 2 << 8 | 1 << 4 | 1;          // FLUSH_CACHE2
-            s[n++] = WAIT_ALL;
-            if (!cb->draws.empty()) {
-                s[n++] = 34ULL << 56 | 0xf;                                     // REQ_RESOURCE: compute, fragment, tiler, IDVS
-                if (!d->heap_set.exchange(true)) {                              // the queue's tiler heap, once
-                    s[n++] = move48(0, d->heap_ctx);
-                    s[n++] = 48ULL << 56;                                       // HEAP_SET
-                }
-            }
-            uint8_t *pass_area = nullptr;           // the open Mali pass's first draw (emitDraw), or none
-            uint64_t pass_va = 0;
-            uint8_t *pass_ir = nullptr;             // ... and its incremental rendering (emitIr)
-            uint64_t pass_ir_va = 0;
-            for (size_t i = 0; i < cb->blits.size(); i++) {
-                const Job &b = cb->blits[i];
-                auto *pc = (uint8_t *)cb->stream.cpu + fau_at[i];
-                if (b.shader == DRAW) {
-                    const DrawJob &dj = cb->draws[b.dst];
-                    bool first = pass_area == nullptr;
-                    bool last = i + 1 >= cb->blits.size() || cb->blits[i + 1].shader != DRAW ||
-                        !samePass(dj, cb->draws[cb->blits[i + 1].dst]);
-                    if (first) {
-                        pass_area = pc;
-                        pass_va = cb->stream.va + fau_at[i];
-                        pass_ir = ir_at[i] != 0 ? (uint8_t *)cb->stream.cpu + ir_at[i] : nullptr;
-                        pass_ir_va = ir_at[i] != 0 ? cb->stream.va + ir_at[i] : 0;
-                    }
-                    // (metal_stats: STORE_STATE timestamp, opcode 40, into the command buffer's timestamps, r80:r81
-                    // the address; after everything before it is done)
-                    auto stamp = [&] {
-                        if (cb->timestamps.size != 0 && (cb->timestamp_count + 1) * 8 <= cb->timestamps.size) {
-                            s[n++] = WAIT_ALL;
-                            s[n++] = move48(80, cb->timestamps.va + 8ULL * cb->timestamp_count++);
-                            s[n++] = 40ULL << 56 | 80ULL << 40 | 0ULL << 32;
-                        }
-                    };
-                    if (first) stamp();
-                    emitDraw(d, dj, pc, cb->stream.va + fau_at[i], s, n, first, last, pass_area, pass_va, pass_ir, pass_ir_va);
-                    if (last) stamp();
-                    cb->draw_areas.push_back(fau_at[i]);
-                    if (last) {
-                        pass_area = nullptr;
-                    }
-                    continue;
-                }
-                uint64_t fau_va = cb->stream.va + fau_at[i], spd;
-                unsigned fau_entries, size[3], groups[3];
-                uint64_t local_storage = d->descriptors.va + 0x1200;            // none
-                uint64_t resources = 0;
-                if (b.shader == DISPATCH) {
-                    const mali_kernel_binary &k = b.kernel->binary;
-                    auto *w = (uint32_t *)pc;
-                    memset(pc, 0, k.fau_words * 4);
-                    memcpy(pc, b.buffers, sizeof(b.buffers));                       // words 2n, 2n+1
-                    for (int c = 0; c < 3; c++) {
-                        w[MALI_KERNEL_WORKGROUP_WORD + c] = b.threads[c];
-                        w[MALI_KERNEL_GROUPS_WORD + c] = b.groups[c];
-                        w[MALI_KERNEL_GRID_WORD + c] = b.grid[c];
-                    }
-                    memcpy(w + MALI_KERNEL_RESERVED, k.consts, (k.fau_words - MALI_KERNEL_RESERVED) * 4);
-                    if (k.tls_size != 0 || b.wls_size != 0) {
-                        // the local storage descriptor (Mesa's genxml v10 "Local Storage"): spill space, packed, per thread
-                        // 16 << word 0 bytes; threadgroup memory 2^(word 1 & 31) instances of 2^((word 1 >> 8) - 1) bytes
-                        uint64_t at = (k.fau_words * 4 + 0x3f) & ~0x3fULL;
-                        auto *ls = (uint32_t *)(pc + at);
-                        memset(ls, 0, 32);
-                        if (k.tls_size != 0) {
-                            ls[0] = log2u((k.tls_size + 15) / 16);
-                            ls[2] = (uint32_t)(d->tls[ls[0]].va >> 8);
-                            ls[3] = (uint32_t)(d->tls[ls[0]].va >> 40) | 1u << 28;
-                        }
-                        if (b.wls_size != 0) {
-                            ls[1] = log2u(b.wls_instances) | (log2u(b.wls_size) + 1) << 8;
-                            ls[4] = (uint32_t)d->wls.va;
-                            ls[5] = (uint32_t)(d->wls.va >> 32);
-                        } else {
-                            ls[1] = 31;                                         // no threadgroup memory
-                        }
-                        local_storage = fau_va + at;
-                    }
-                    if (b.texture_count || b.sampler_count) {
-                        // the resource table (r0): 16-byte entries, table t's descriptors at entry t (gallium's
-                        // numbering: sampler 3, texture 4, image 5); each texture once in the texture table, once in the
-                        // image table, its plane after them
-                        uint64_t at = ((k.fau_words * 4 + 0x3f) & ~0x3fULL) + 0x40;
-                        uint8_t *rt = pc + at;
-                        uint64_t rt_va = fau_va + at, tex_va = rt_va + 0x80;
-                        uint64_t samp_va = tex_va + b.texture_count * 32, img_va = samp_va + b.sampler_count * 32;
-                        uint64_t plane_va = img_va + b.texture_count * 32;
-                        memset(rt, 0, 0x80);
-                        auto entry = [&](unsigned table, uint64_t va, unsigned count) {
-                            auto *e = (uint32_t *)(rt + 16 * table);
-                            e[0] = (uint32_t)va;
-                            e[1] = (uint32_t)(va >> 32) | 1u << 24;                 // contains descriptors
-                            e[2] = count * 32;
-                        };
-                        entry(MALI_TABLE_TEXTURE, tex_va, b.texture_count);
-                        entry(MALI_TABLE_SAMPLER, samp_va, b.sampler_count);
-                        entry(MALI_TABLE_IMAGE, img_va, b.texture_count);
-                        for (unsigned t = 0; t < b.texture_count; t++) {
-                            auto *tex = (uint32_t *)(pc + (tex_va - fau_va) + 32 * t);
-                            auto *img = (uint32_t *)(pc + (img_va - fau_va) + 32 * t);
-                            uint32_t plane[8];
-                            if (b.textures[t] == nullptr) {
-                                memset(tex, 0, 32);
-                                memset(img, 0, 32);
-                                continue;
-                            }
-                            // (one plane, shared by the two descriptors; 32-byte aligned as everything here)
-                            uint64_t pva = plane_va;
-                            plane_va = pva + 32;
-                            describe(b.textures[t], tex, plane, pva);
-                            memcpy(pc + (pva - fau_va), plane, 32);
-                            memcpy(img, tex, 32);
-                        }
-                        for (unsigned t = 0; t < b.sampler_count; t++) {
-                            memcpy(pc + (samp_va - fau_va) + 32 * t, b.samplers[t], 32);
-                        }
-                        resources = rt_va | MALI_TABLES;
-                    }
-                    spd = b.kernel->spd;
-                    fau_entries = (k.fau_words + 1) / 2;
-                    memcpy(size, b.threads, sizeof(size));
-                    memcpy(groups, b.groups, sizeof(groups));
-                } else {
-                    memset(pc, 0, 32);
-                    memcpy(pc + 0, &b.dst, 8);
-                    memcpy(pc + 8, &b.src, 8);
-                    memcpy(pc + 16, &b.value, 4);
-                    memcpy(pc + 20, &b.count, 4);
-                    if (b.shader == COPY_ROWS) {
-                        memcpy(pc + 24, &b.src_stride, 4);
-                        memcpy(pc + 28, &b.dst_stride, 4);
-                        spd = d->spd[4];
-                    } else {
-                        spd = d->spd[b.shader];
-                    }
-                    fau_entries = 4;                                                // 8 words: 4 of 64 bits
-                    size[0] = 64, size[1] = size[2] = 1;                            // 64 invocations a workgroup
-                    groups[0] = (b.count + 63) / 64, groups[1] = groups[2] = 1;
-                }
-                // A COMPUTE JOB AFTER OTHER WORK OF THIS COMMAND BUFFER (11-10): the load/store caches cleaned and the
-                // texture caches dropped first, as a render pass now opens (pass_inv) -- a blit or kernel reading what a
-                // pass or another job just wrote (CoreAnimation's backdrop blurs copy what is drawn so far) could read a
-                // core's stale texture lines: the widgets page's and the App Library's blurred backgrounds came out
-                // empty or with noise for a frame (the tester's clips). Jobs were only ordered (WAIT_ALL).
-                if (i > 0) {
-                    s[n++] = move32(74, 0);
-                    s[n++] = 36ULL << 56 | 74ULL << 40 | 2 << 8 | 1 << 4;      // FLUSH_CACHE2: LSC clean, others invalidated
-                    s[n++] = WAIT_ALL;
-                }
-                s[n++] = move48(16, spd);
-                s[n++] = move48(24, local_storage);
-                s[n++] = move48(8, fau_va);
-                s[n++] = move32(9, (uint32_t)(fau_va >> 32) | fau_entries << 24);
-                s[n++] = move48(0, resources);                                      // the resource table, or none
-                s[n++] = move32(32, 0);
-                s[n++] = move32(33, (size[0] - 1) | (size[1] - 1) << 10 | (size[2] - 1) << 20);
-                s[n++] = move32(34, 0);
-                s[n++] = move32(35, 0);
-                s[n++] = move32(36, 0);
-                s[n++] = move32(37, groups[0]);
-                s[n++] = move32(38, groups[1]);
-                s[n++] = move32(39, groups[2]);
-                s[n++] = RUN_COMPUTE;
-                s[n++] = WAIT_ALL;                                                  // in order, as Metal's encoders are
-            }
-            s[n++] = move32(74, 0);
-            s[n++] = 36ULL << 56 | 74ULL << 40 | 2 << 8 | 1 << 4 | 1;          // FLUSH_CACHE2, as at the start
-            s[n++] = WAIT_ALL;
-            __asm__ volatile("dsb sy" ::: "memory");
+        unsigned n = 0;
+        if (emitStream(cb, d, n)) {
             syncobj_create sc = {};
             sync_op signal = {};
             queue_submit qs = {};

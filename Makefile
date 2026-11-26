@@ -118,7 +118,7 @@ MALI_CACHE_BUILD = $(shell cat src/mali/compile_mali.c src/mali/compile_mali.h $
 	$$(cat $(MALI_MESA)/archives 2>/dev/null) 2>/dev/null | (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-24)
 
 # the back end, one file a topic (11-24, split from c_api_mali.cpp): mali_internal.h has the shared types and prototypes
-MALI_SRCS = formats jobs device kernels textures programs draws surfaces iogpu
+MALI_SRCS = formats jobs device kernels textures programs draws surfaces iogpu external
 MALI_OBJS = $(MALI_SRCS:%=$(MALI_OUT)/obj/mali_%.o)
 MALI_CACHE_FLAG = $(if $(strip $(MALI_CACHE_BUILD)),-DHAKIOS_MALI_CACHE_BUILD='"$(MALI_CACHE_BUILD)"')
 
