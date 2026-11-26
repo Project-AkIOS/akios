@@ -125,6 +125,9 @@ cacheKey(const void *vs, size_t vs_size, const std::vector<mali_constant> &vc, c
         // (and the compile options the boot-args choose: compile_mali.c's mali_mediump=0)
         static const uint32_t no_mediump = bootArg("mali_mediump=0") ? 1 : 0;
         fnv(h, &no_mediump, sizeof(no_mediump));
+        // (11-26: and mali_defer=0 -- a deferred fragment stage, kept without code, must not answer for a refusal)
+        static const uint32_t no_defer = bootArg("mali_defer=0") ? 1 : 0;
+        if (no_defer) fnv(h, &no_defer, sizeof(no_defer));
     }
 #else
     fnvImage(h);
@@ -274,8 +277,10 @@ cacheLoad(uint64_t key, mali_kernel_binary *vs, mali_kernel_binary *fs)
         ok = readAll(fd, b[i], sizeof(mali_kernel_binary));
         b[i]->code = nullptr;
         b[i]->varyings = nullptr;               // (the layout a fragment stage is compiled against: not kept)
-        if (ok && (b[i]->size == 0 || b[i]->size > (16u << 20))) ok = false;
-        if (ok) {
+        // (11-26) a deferred fragment stage (compile_mali.h) is kept with no code: what it reads, for the plug-in to
+        // specialise it, without the seconds its front end takes again at every pipeline of it
+        if (ok && ((b[i]->size == 0 && !(i == 1 && b[i]->deferred)) || b[i]->size > (16u << 20))) ok = false;
+        if (ok && b[i]->size != 0) {
             b[i]->code = malloc(b[i]->size);
             ok = b[i]->code != nullptr && readAll(fd, b[i]->code, b[i]->size);
         }
@@ -412,6 +417,29 @@ hakios_metal_program_stage_words(hakios_metal_program *p, unsigned stage)
 }
 
 unsigned
+hakios_metal_program_seen_contents(hakios_metal_program *base, unsigned binding, void *bytes, size_t each,
+    unsigned *lengths, unsigned max)
+{
+    if (base == nullptr || max == 0 || each == 0) return 0;
+    uint64_t key;
+    {
+        std::lock_guard<std::mutex> g(base->lock);
+        key = seenKey(base);
+    }
+    return seenRead(key, binding, bytes, each, lengths, max);
+}
+
+int
+hakios_metal_program_control_mask(hakios_metal_program *p, unsigned binding, uint8_t mask[32])
+{
+    if (p == nullptr) return 0;
+    std::lock_guard<std::mutex> g(p->lock);
+    if (!p->fs.deferred || p->fs.control_binding != binding) return 0;
+    memcpy(mask, p->fs.control, 32);
+    return 1;
+}
+
+unsigned
 hakios_metal_program_resource_count(hakios_metal_program *p, unsigned stage)
 {
     return p == nullptr ? 0 : stage == 0 ? p->vs.num_resources : p->fs.num_resources;
@@ -484,6 +512,8 @@ std::vector<mali_constant>
 keyedConstants(const hakios_metal_program *p, const std::vector<mali_constant> &fc)
 {
     if (p->known_binding < 0) return fc;
+    // (11-26: KNOWN is already masked for a deferred base -- compile_mali.c's control_mask, part of what the compiler's
+    // build hash covers -- so the masked bytes are the key, as wanted)
     std::vector<mali_constant> k(fc.size() + 1 + (p->known.size() + 7) / 8);   // (value-initialised: no stray padding)
     std::copy(fc.begin(), fc.end(), k.begin());
     size_t at = fc.size();
@@ -550,6 +580,73 @@ compileFetch(hakios_metal_program *p)
     p->fs = fs;
     p->fetch_refusal.clear();
     return true;
+}
+uint64_t
+seenKey(const hakios_metal_program *p)
+{
+    bool blended = p->shader_blend.mask != 0 || p->shader_blend.format[0] || p->shader_blend.format[1] ||
+        p->shader_blend.format[2] || p->shader_blend.format[3];
+    if (p->fs_bitcode.empty()) blended = false;
+    static const mali_constant tag = { 0x53454e00u, 0x6e656573u };     // ("seen": apart from every program's own key)
+    std::vector<mali_constant> fc = p->fs_constants;
+    fc.push_back(tag);
+    return cacheKey(p->vs_bitcode.data(), p->vs_bitcode.size(), p->vs_constants, p->fs_bitcode.data(), p->fs_bitcode.size(),
+                    fc, p->color_format, p->fetch_described ? &p->fetch : nullptr, blended ? &p->shader_blend : nullptr);
+}
+// a record: binding (4 bytes), length (4), the bytes; appended once a content (O_APPEND: whole records, one process)
+static std::mutex seen_lock;
+unsigned
+seenRead(uint64_t key, unsigned binding, void *bytes, size_t each, unsigned *lengths, unsigned max)
+{
+    if (!cacheOn() || cacheDir().empty()) return 0;
+    int fd = open((cachePath(key) + ".seen").c_str(), O_RDONLY);
+    if (fd < 0) return 0;
+    unsigned n = 0;
+    uint32_t head[2];
+    uint8_t buf[4096];
+    while (n < max && readAll(fd, head, sizeof(head)) && head[1] != 0 && head[1] <= sizeof(buf) && readAll(fd, buf, head[1])) {
+        if (head[0] != binding || head[1] > each) continue;
+        if (bytes != nullptr) memcpy((uint8_t *)bytes + (size_t)n * each, buf, head[1]);
+        if (lengths != nullptr) lengths[n] = head[1];
+        n++;
+    }
+    close(fd);
+    return n;
+}
+void
+seenNote(const hakios_metal_program *p)
+{
+    if (p->known_binding < 0 || p->known.empty() || p->known.size() > 4096 || !cacheOn() || cacheDir().empty()) return;
+    std::lock_guard<std::mutex> g(seen_lock);
+    uint64_t key = seenKey(p);
+    std::string path = cachePath(key) + ".seen";
+    {
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            uint32_t head[2];
+            uint8_t buf[4096];
+            unsigned records = 0;
+            while (readAll(fd, head, sizeof(head)) && head[1] != 0 && head[1] <= sizeof(buf) && readAll(fd, buf, head[1])) {
+                records++;
+                if (head[0] == (uint32_t)p->known_binding && head[1] == p->known.size() &&
+                    memcmp(buf, p->known.data(), head[1]) == 0) {
+                    close(fd);
+                    utimes(path.c_str(), nullptr);      // (used now: the trim keeps it)
+                    return;
+                }
+            }
+            close(fd);
+            if (records >= 1024) return;            // (enough: the plug-in keeps 256 a pipeline)
+        }
+    }
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    std::vector<uint8_t> rec(8 + p->known.size());
+    uint32_t head[2] = { (uint32_t)p->known_binding, (uint32_t)p->known.size() };
+    memcpy(rec.data(), head, 8);
+    memcpy(rec.data() + 8, p->known.data(), p->known.size());
+    (void)writeAll(fd, rec.data(), rec.size());
+    close(fd);
 }
 bool
 maliFactor(unsigned metal, MaliFactor &f)

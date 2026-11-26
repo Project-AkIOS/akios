@@ -90,6 +90,17 @@ struct mali_kernel_binary {
 	unsigned rt_written;             /* a fragment function's: bit n, [[color(n)]] written */
 	unsigned rt_read;                /* ... bit n, [[color(n)]] read (framebuffer fetch: LD_TILE) */
 	unsigned helpers;                /* a fragment function's: needs helper threads (derivatives across its 2x2 quads) */
+	/* (11-26) a fragment function too big for the back end as it is (compile_nir: mali_maxblocks) that reads a small
+	 * constant buffer -- an uber shader whose path is that buffer's configuration (iOS 27's CoreAnimation: the generic
+	 * fixed_frag_lph_cpf, fc_generic=1, ~3600 blocks, its config_buffer [[buffer(0)]] of 52 bytes): no CODE (size 0),
+	 * the resources and outputs filled in; it is compiled only per content of that buffer (mali_compile_known,
+	 * hakios_metal_program_specialize), a draw with this one is refused */
+	unsigned deferred;
+	/* (11-26) a deferred one's: which bytes of [[buffer(control_binding)]] decide its control flow (bit n of
+	 * control[n / 8]: byte n; bytes 0 to 255) -- the only ones a specialisation folds and is told apart by
+	 * (compile_mali.c's control_mask); the rest stay loads at run time */
+	unsigned control_binding;
+	uint8_t control[32];
 };
 
 struct mali_constant {
@@ -117,7 +128,8 @@ int mali_stage_compile(const void *bitcode, size_t size, const struct mali_const
  * compiles read [[buffer(BINDING)]] at constant offsets as these bytes, folded through the shader -- an uber shader
  * (CoreAnimation's fixed_frag_lph_cpf, ~20 000 instructions) keeps only the path the buffer's configuration takes.
  * NULL: none (the default) */
-struct mali_known_buffer { unsigned binding; const uint8_t *bytes; size_t length; };
+/* (11-26) MASK: NULL, or a bit a byte (bit n % 8 of MASK[n / 8]): only loads whose bytes are all set are folded */
+struct mali_known_buffer { unsigned binding; const uint8_t *bytes; size_t length; const uint8_t *mask; };
 void mali_compile_known(const struct mali_known_buffer *known);
 /* a fragment function with the blend of the targets in BLEND->MASK done in the shader (Metal's numbers: MTLBlendOperation,
  * MTLBlendFactor, MTLColorWriteMask), from the tile buffer's pixel (framebuffer fetch); otherwise mali_stage_compile's */

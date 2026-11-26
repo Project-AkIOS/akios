@@ -304,7 +304,19 @@ hakios_metal_program *hakios_metal_program_new_bitcode_constants(const void *vs_
  * descriptor and sample count come with it. NULL with the reason. */
 hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitcode, size_t fs_size,
     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
-/* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
+/* (11-26) the contents of [[buffer(BINDING)]] that programs specialised from a program like BASE (the same functions,
+ * constants, format, vertex descriptor and blending) were made for, on this boot or an earlier one (kept beside the
+ * program cache): up to MAX of them, EACH bytes apart in BYTES, their lengths in LENGTHS; how many. For loading those
+ * programs (hakios_metal_program_specialize: found in the cache) before a draw asks for them. */
+/* (11-26) of a program whose fragment stage was not compiled whole (stage_words 0): which bytes of [[buffer(BINDING)]]
+ * decide its control flow (bit n % 8 of MASK[n / 8]: byte n), the only ones its specialisations depend on -- a content
+ * is that buffer's bytes with the others zeroed; 1, or 0 (no mask: all bytes count) */
+int hakios_metal_program_control_mask(hakios_metal_program *program, unsigned binding, uint8_t mask[32]);
+unsigned hakios_metal_program_seen_contents(hakios_metal_program *base, unsigned binding, void *bytes, size_t each,
+    unsigned *lengths, unsigned max);
+/* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to. 0 for a fragment function (11-26):
+ * an uber shader too big to compile whole that reads a constant buffer of 256 bytes at most -- the program is made,
+ * its draws are refused, only hakios_metal_program_specialize's programs of it draw */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
 void hakios_metal_program_free(hakios_metal_program *program);
 /* the buffers made from the kernel and those taken again from a queue's pool since the last call, and the bytes made */
@@ -681,6 +693,11 @@ hakios_metal_texture *hakios_metal_texture_wrap_rows(hakios_metal_device *device
  *             hakios_metal_cb_error() saying why for HAKIOS_METAL_ERROR.
  * hakios_metal_cb_free() frees it (after _retire, or never committed). No callbacks, no queue thread, no _wait. */
 hakios_metal_cb *hakios_metal_cb_new_external(hakios_metal_device *device);
+/* (11-26) for checking that what a command buffer uses is still there before it is submitted: every piece of memory its
+ * work reads or writes that the caller can name -- the buffers and textures it holds, the draws' colour targets -- as
+ * (VA, SIZE) pairs, up to MAX; how many. And a texture's memory (its BO; a view's is its parent's): 1, or 0. */
+unsigned hakios_metal_cb_ranges(hakios_metal_cb *cb, uint64_t *va, uint64_t *size, unsigned max);
+int hakios_metal_texture_range(hakios_metal_texture *texture, uint64_t *va, uint64_t *size);
 int hakios_metal_cb_build(hakios_metal_cb *cb, uint64_t *va, uint32_t *length);
 enum hakios_metal_status hakios_metal_cb_retire(hakios_metal_cb *cb, uint32_t iogpu_status);
 

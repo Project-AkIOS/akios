@@ -630,6 +630,12 @@ fold_known_load(nir_builder *b, nir_intrinsic_instr *in, void *data)
 	if ((bits != 8 && bits != 16 && bits != 32 && bits != 64) || at + (uint64_t)n * (bits / 8) > k->length) {
 		return false;
 	}
+	/* (11-26) only what decides the control flow (control_mask): the rest stays a load, read at run time */
+	for (uint64_t i = at; k->mask != NULL && i < at + (uint64_t)n * (bits / 8); i++) {
+		if (i >= 256 || !(k->mask[i / 8] & (1u << (i % 8)))) {
+			return false;
+		}
+	}
 	nir_const_value v[NIR_MAX_VEC_COMPONENTS];
 	memset(v, 0, sizeof(v));
 	for (unsigned c = 0; c < n; c++) {
@@ -665,6 +671,197 @@ fold_known(nir_shader *s, const struct mali_known_buffer *k)
 		NIR_PASS(progress, s, nir_opt_dce);
 	} while (progress && ++round < 32);
 	nir_shader_gather_info(s, nir_shader_get_entrypoint(s));
+}
+
+/*
+ * WHICH BYTES DECIDE THE CONTROL FLOW (11-26): a deferred uber shader (compile_mali.h) was specialised on all 52 bytes
+ * of its config_buffer, and CoreAnimation's Setup slide brought ~18 new contents a boot, each a 0.4-1 s compile its draw
+ * waited for -- the slide stopped. Most of those bytes are values (a float at 48, opacities, colours) that only feed
+ * arithmetic. So, on a copy of the front end's shader cleaned up (constants folded, phis gone where they can go), each
+ * load of BINDING at a constant offset is followed through its uses: it is CONTROL when it reaches a branch's
+ * condition (a loop's exit is one), a texture's or sampler's choice, an address or index (a load's or store's, an array
+ * deref's), a value stored to memory or a variable that is not an output (it may come back as anything), or an
+ * instruction this does not know. Through ALU instructions and phis it goes on; into a texture's coordinates, lod or
+ * bias, or an output's value, it stops (data). A load at an offset not known here that is control makes every byte
+ * control. MASK gets a bit for each byte of each control load; false: nothing of BINDING read (the mask all ones).
+ */
+#define CONTROL_HARD 0x40000000u
+
+/* the instructions an if decides between (both sides, what is nested in them); with a break in it, the loop it ends too */
+static unsigned
+if_cost(nir_if *nif)
+{
+	unsigned n = 0;
+	bool breaks = false;
+
+	nir_foreach_block_in_cf_node(block, &nif->cf_node) {
+		nir_foreach_instr(instr, block) {
+			n++;
+			if (instr->type == nir_instr_type_jump && nir_instr_as_jump(instr)->type == nir_jump_break) {
+				breaks = true;
+			}
+		}
+	}
+	for (nir_cf_node *up = nif->cf_node.parent; breaks && up != NULL; up = up->parent) {
+		if (up->type == nir_cf_node_loop) {
+			nir_foreach_block_in_cf_node(block, up) {
+				nir_foreach_instr(instr, block) {
+					n++;
+				}
+			}
+			break;
+		}
+	}
+	return n;
+}
+
+/* what one use of a value read from the buffer costs if the value is not known: 0 (data), an if's instructions, or
+ * CONTROL_HARD (a texture's or sampler's choice, an address or index, a store other than an output's, anything not
+ * known here); an ALU instruction's or phi's result goes on the stack, to be followed */
+static unsigned
+control_use(nir_src *src, nir_def **stack, unsigned *top, unsigned most, BITSET_WORD *seen)
+{
+	if (nir_src_is_if(src)) {
+		return if_cost(nir_src_use_if(src));
+	}
+	nir_instr *u = nir_src_use_instr(src);
+	nir_def *next = NULL;
+
+	switch (u->type) {
+	case nir_instr_type_alu:
+		next = &nir_instr_as_alu(u)->def;
+		break;
+	case nir_instr_type_phi:
+		next = &nir_instr_as_phi(u)->def;
+		break;
+	case nir_instr_type_tex: {
+		nir_tex_src *ts = container_of(src, nir_tex_src, src);
+		switch (ts->src_type) {
+		case nir_tex_src_coord: case nir_tex_src_projector: case nir_tex_src_comparator: case nir_tex_src_lod:
+		case nir_tex_src_bias: case nir_tex_src_ddx: case nir_tex_src_ddy: case nir_tex_src_min_lod:
+			return 0;               /* a value it samples with: data */
+		default:
+			return CONTROL_HARD;
+		}
+	}
+	case nir_instr_type_intrinsic: {
+		nir_intrinsic_instr *in = nir_instr_as_intrinsic(u);
+		const unsigned i = (unsigned)(src - in->src);
+
+		switch (in->intrinsic) {
+		case nir_intrinsic_store_output:
+			return i != 0 ? CONTROL_HARD : 0;
+		case nir_intrinsic_store_deref: {
+			nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+			nir_variable *var = d != NULL ? nir_deref_instr_get_variable(d) : NULL;
+			return i == 1 && var != NULL && var->data.mode == nir_var_shader_out ? 0 : CONTROL_HARD;
+		}
+		case nir_intrinsic_ddx: case nir_intrinsic_ddy: case nir_intrinsic_ddx_fine: case nir_intrinsic_ddy_fine:
+		case nir_intrinsic_ddx_coarse: case nir_intrinsic_ddy_coarse:
+			next = &in->def;
+			break;
+		default:
+			return CONTROL_HARD;
+		}
+		break;
+	}
+	default:
+		return CONTROL_HARD;
+	}
+	if (next != NULL && !BITSET_TEST(seen, next->index)) {
+		BITSET_SET(seen, next->index);
+		if (*top == most) {
+			return CONTROL_HARD;    /* (more than this looks at: control, to be safe) */
+		}
+		stack[(*top)++] = next;
+	}
+	return 0;
+}
+
+/* the instructions LOAD's value decides (control_use, summed over everything it reaches), CONTROL_HARD at most */
+static unsigned
+control_cost(nir_def *load, nir_def **stack, unsigned most, BITSET_WORD *seen, unsigned words)
+{
+	unsigned top = 0, cost = 0;
+
+	memset(seen, 0, words * sizeof(BITSET_WORD));
+	BITSET_SET(seen, load->index);
+	stack[top++] = load;
+	while (top != 0 && cost < CONTROL_HARD) {
+		nir_def *d = stack[--top];
+
+		nir_foreach_use_including_if(src, d) {
+			const unsigned c = control_use(src, stack, &top, most, seen);
+			cost = c >= CONTROL_HARD || cost + c >= CONTROL_HARD ? CONTROL_HARD : cost + c;
+		}
+	}
+	return cost;
+}
+
+static bool
+control_mask(const nir_shader *front, unsigned binding, unsigned branch_most, uint8_t mask[32])
+{
+	nir_shader *s = nir_shader_clone(NULL, front);
+	bool progress, any = false;
+	unsigned round = 0;
+
+	memset(mask, 0, 32);
+	do {
+		progress = false;
+		NIR_PASS(progress, s, nir_lower_vars_to_ssa);
+		NIR_PASS(progress, s, nir_opt_copy_prop);
+		NIR_PASS(progress, s, nir_opt_constant_folding);
+		NIR_PASS(progress, s, nir_opt_algebraic);
+		NIR_PASS(progress, s, nir_opt_dead_cf);
+		NIR_PASS(progress, s, nir_opt_cse);
+		NIR_PASS(progress, s, nir_opt_dce);
+		NIR_PASS(progress, s, nir_opt_remove_phis);
+	} while (progress && ++round < 16);
+	nir_foreach_function_impl(impl, s) {
+		nir_index_ssa_defs(impl);
+		const unsigned words = BITSET_WORDS(impl->ssa_alloc), most = impl->ssa_alloc + 1;
+		BITSET_WORD *seen = malloc(words * sizeof(BITSET_WORD));
+		nir_def **stack = malloc(most * sizeof(nir_def *));
+
+		if (seen == NULL || stack == NULL) {
+			free(seen);
+			free(stack);
+			memset(mask, 0xff, 32);
+			ralloc_free(s);
+			return true;
+		}
+		nir_foreach_block(block, impl) {
+			nir_foreach_instr(instr, block) {
+				if (instr->type != nir_instr_type_intrinsic) continue;
+				nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+				if ((in->intrinsic != nir_intrinsic_load_ubo && in->intrinsic != nir_intrinsic_load_ssbo) ||
+				    !nir_src_is_const(in->src[0]) || nir_src_as_uint(in->src[0]) != binding) continue;
+				any = true;
+				const unsigned cost = control_cost(&in->def, stack, most, seen, words);
+				if (getenv("MALI_CTLSAY") != NULL) {
+					fprintf(stderr, "control: load at %lld, %u bytes: %u\n", nir_src_is_const(in->src[1]) ?
+					    (long long)nir_src_as_uint(in->src[1]) : -1LL, in->def.num_components * MAX2(in->def.bit_size / 8, 1), cost);
+				}
+				if (cost <= branch_most) continue;     /* nothing, or little enough to leave a branch at run time */
+				if (!nir_src_is_const(in->src[1])) {
+					memset(mask, 0xff, 32);         /* where it reads is not known here: all of it */
+					continue;
+				}
+				const uint64_t at = nir_src_as_uint(in->src[1]);
+				const uint64_t end = at + (uint64_t)in->def.num_components * (in->def.bit_size == 1 ? 1 : in->def.bit_size / 8);
+				for (uint64_t b = at; b < end && b < 256; b++) {
+					mask[b / 8] |= (uint8_t)(1u << (b % 8));
+				}
+			}
+		}
+		free(seen);
+		free(stack);
+	}
+	ralloc_free(s);
+	if (!any) {
+		memset(mask, 0xff, 32);
+	}
+	return any;
 }
 
 /* Metal's MTLBlendFactor as gallium's (nir_lower_blend's) */
@@ -873,6 +1070,21 @@ compile_nir(nir_shader *s, mesa_shader_stage want, const void *vs_varyings, stru
 	const char *why = NULL;
 	int result = -1;
 
+	/* (11-26) the front end's shader as it is, for control_mask should this one be deferred (below): a fragment stage
+	 * not being specialised, of more blocks than the limit already (the cleanup takes some away, never adds) */
+	nir_shader *front = NULL;
+	if (want == MESA_SHADER_FRAGMENT && known_now == NULL) {
+		unsigned blocks = 0;
+		nir_foreach_function_impl(impl, s) {
+			nir_foreach_block(block, impl) {
+				blocks++;
+			}
+		}
+		const unsigned limit = mali_boot_number("mali_maxblocks", 1000);
+		if (limit != 0 && blocks > limit) {
+			front = nir_shader_clone(NULL, s);
+		}
+	}
 	if (want == MESA_SHADER_FRAGMENT && known_now != NULL) {
 		fold_known(s, known_now);
 	}
@@ -998,6 +1210,57 @@ compile_nir(nir_shader *s, mesa_shader_stage want, const void *vs_varyings, stru
 				}
 			}
 		}
+		/*
+		 * (11-26) AN UBER SHADER DECIDED BY A BUFFER, NOT BY ITS CONSTANTS: iOS 27's VfxXgh + A3Xghfc / A2Xghfc are the
+		 * generic fixed_frag_lph_cpf with fc_generic=1. Their function constants are already immediates here (the
+		 * front end loads them as such; pan_preprocess_nir's bi_optimize_loop folds them: 8524 blocks to 3598, on the
+		 * host as on the phone) -- what is left is decided at run time by its config_buffer ([[buffer(0)]], 52
+		 * bytes: 180 loops over its image count, 1079 ifs over its opcodes). Compiled whole it is 342 KB of code, 64
+		 * registers, 176 bytes spilled a thread, 11 s on the host; folded for one content of that buffer (fold_known)
+		 * it is 1 to 13 blocks, 0.4 to 3 KB, 0.2 s with the front end. So such a fragment stage -- over the limit,
+		 * not being specialised already, and reading a constant buffer of 256 bytes at most (what the plug-in's
+		 * akKeepFragment specialises on) -- is not refused: it is given back without code (out->deferred) and only
+		 * its specialisations are compiled; a draw with it is refused (mali_draws.cpp). Anything else over the limit
+		 * is refused as before.
+		 */
+		bool small_buffer = false;
+		unsigned small_binding = ~0u;
+		for (unsigned i = 0; i < out->num_resources; i++) {
+			if (out->resources[i].kind == AIR_RESOURCE_CONSTANT_BUFFER && out->resources[i].size != 0 &&
+			    out->resources[i].size <= 256) {
+				small_buffer = true;
+				if (out->resources[i].index < small_binding) {
+					small_binding = out->resources[i].index;    /* (the plug-in's akKeepFragment takes the lowest) */
+				}
+			}
+		}
+		if (max_blocks != 0 && blocks > max_blocks && want == MESA_SHADER_FRAGMENT && known_now == NULL && small_buffer &&
+		    !mali_boot_arg("mali_defer=0")) {
+			fprintf(stderr, "mali compile: %s: %u blocks, %u instructions: compiled per content of its constant buffer "
+			    "only (deferred)\n", out->name, blocks, instrs);
+			out->deferred = 1;
+			out->control_binding = small_binding;
+			if (front == NULL || mali_boot_arg("mali_ctlmask=0")) {
+				memset(out->control, 0xff, sizeof(out->control));
+			} else {
+				struct timespec m0, m1;
+				char bytes[260];
+				int at = 0;
+
+				clock_gettime(CLOCK_MONOTONIC, &m0);
+				control_mask(front, small_binding, mali_boot_number("mali_ctlbranch", 2000), out->control);
+				clock_gettime(CLOCK_MONOTONIC, &m1);
+				for (unsigned b = 0; b < 256 && at < (int)sizeof(bytes) - 8; b++) {
+					if (out->control[b / 8] & (1u << (b % 8))) {
+						at += snprintf(bytes + at, sizeof(bytes) - (size_t)at, "%s%u", at ? "," : "", b);
+					}
+				}
+				fprintf(stderr, "mali compile: %s: the bytes of [[buffer(%u)]] that decide its control flow: %s (%.0f ms)\n",
+				    out->name, small_binding, at ? bytes : "none", ((m1.tv_sec - m0.tv_sec) * 1e3 + (m1.tv_nsec - m0.tv_nsec) / 1e6));
+			}
+			result = 0;
+			goto done;
+		}
 		if (max_blocks != 0 && blocks > max_blocks) {
 			say(error, error_size, "%s: %u blocks, %u instructions: too big for the Mali back end's spiller yet "
 			    "(mali_maxblocks=%u)", out->name, blocks, instrs, max_blocks);
@@ -1077,6 +1340,9 @@ compile_nir(nir_shader *s, mesa_shader_stage want, const void *vs_varyings, stru
 	result = 0;
 done:
 	free(varyings);
+	if (front != NULL) {
+		ralloc_free(front);
+	}
 	return result;
 }
 

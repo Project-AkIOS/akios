@@ -344,6 +344,11 @@ drawImpl(hakios_metal_cb *cb, hakios_metal_program *p, const struct hakios_metal
     else if (pass->store_action > 1) refused = "a store action other than DontCare and Store";
     else if (pass->visibility && pass->visibility_mode) refused = "visibility results (not on the Mali yet)";
     else if (!p->blend_refusal.empty()) refused = p->blend_refusal.c_str();
+    // (11-26) an uber shader's whole fragment stage, too big to compile: its draws go with a specialisation of it
+    // (hakios_metal_program_specialize), the plug-in's to ask for; before the vertex descriptor's compile, which would
+    // only take the front end's seconds again
+    else if (p->fs.deferred) refused = "a fragment stage compiled per content of its constant buffer only (deferred), "
+                                       "drawn without a specialisation";
     else if (!compileFetch(p)) refused = p->fetch_refusal.c_str();
     else if (p->samples == 2) refused = "2 samples a pixel (the Mali-G715 has no 2x sample pattern -- Mesa serves it from v12; 4 is served)";
     else if (t->samples != p->samples) refused = "a colour attachment of another sample count than the pipeline's rasterSampleCount";

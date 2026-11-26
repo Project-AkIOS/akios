@@ -1351,6 +1351,17 @@ hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitco
     }
     p->known_binding = (int)binding;
     p->known.assign((const uint8_t *)bytes, (const uint8_t *)bytes + length);
+    {
+        // (11-26) a deferred base: only the bytes that decide its control flow (compile_mali.c's control_mask) are
+        // folded and tell its programs apart -- the rest zero here, read from the buffer at run time
+        std::lock_guard<std::mutex> g(base->lock);
+        if (base->fs.deferred && base->fs.control_binding == binding) {
+            p->known_mask.assign(base->fs.control, base->fs.control + sizeof(base->fs.control));
+            for (size_t i = 0; i < p->known.size(); i++) {
+                if (i >= 256 || !(base->fs.control[i / 8] & (1u << (i % 8)))) p->known[i] = 0;
+            }
+        }
+    }
     // both stages (the vertex stage again: the fragment stage is compiled against its varyings, which no cache keeps),
     // as compileFetch would at the first draw -- here, in the caller's background, and then not again
     bool blended = p->shader_blend.mask != 0 || p->shader_blend.format[0] || p->shader_blend.format[1] ||
@@ -1386,6 +1397,7 @@ hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitco
     p->vs = vs;
     p->fs = fs;
     p->fetch_compiled = true;           // (compileFetch: nothing left to do)
+    seenNote(p);                        // (11-26: the next boot's plug-in loads it before its first draw)
     return p;
 }
 

@@ -432,6 +432,47 @@ hakios_metal_texture_wrap_rows(hakios_metal_device *d, unsigned pixel_format, un
     return textureOver(d, bo, 0, row_bytes, 2, f, pixel_format, width, height, usage, 0);
 }
 
+// (11-26) the memory a texture's descriptors point at (its BO, a view's or a buffer texture's being the parent's): 1, or 0
+int
+hakios_metal_texture_range(hakios_metal_texture *t, uint64_t *va, uint64_t *size)
+{
+    if (t == nullptr || t->bo.va == 0 || t->bo.size == 0) return 0;
+    *va = t->bo.va;
+    *size = t->bo.size;
+    return 1;
+}
+
+// (11-26) every piece of memory a command buffer's work reads or writes that the caller can tell apart: the buffers and
+// textures it holds (a depth texture's colour stand-in with it), each draw's colour targets (a missing one's scratch)
+unsigned
+hakios_metal_cb_ranges(hakios_metal_cb *cb, uint64_t *va, uint64_t *size, unsigned max)
+{
+    unsigned n = 0;
+    auto add = [&](uint64_t a, uint64_t l) {
+        if (a == 0 || l == 0) return;
+        for (unsigned i = 0; i < n && i < max; i++) {
+            if (va[i] == a && size[i] == l) return;
+        }
+        if (n < max) {
+            va[n] = a;
+            size[n] = l;
+        }
+        n++;
+    };
+    if (cb == nullptr) return 0;
+    for (hakios_metal_buffer *b : cb->held) add(b->bo.va, b->bo.size);
+    for (hakios_metal_texture *t : cb->held_textures) {
+        add(t->bo.va, t->bo.size);
+        if (hakios_metal_texture *s = t->stand_in.load()) add(s->bo.va, s->bo.size);
+    }
+    for (const DrawJob &dj : cb->draws) {
+        for (unsigned i = 0; i + 1 < dj.rts && i < 3; i++) {
+            if (dj.more[i].missing) add(dj.more[i].va, (uint64_t)dj.more[i].row_bytes);   // (its start: the scratch)
+        }
+    }
+    return n < max ? n : max;
+}
+
 hakios_metal_cb *
 hakios_metal_cb_new_external(hakios_metal_device *d)
 {

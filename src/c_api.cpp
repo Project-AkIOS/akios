@@ -1238,6 +1238,12 @@ unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stag
     return (stage == 0 ? p->program->program.vs : p->program->program.fs).k.numWords;
 }
 
+// (11-26: the Mali build keeps the contents its specialisations were made for; the Adreno build none)
+unsigned hakios_metal_program_seen_contents(hakios_metal_program*, unsigned, void*, size_t, unsigned*, unsigned) {
+    return 0;
+}
+int hakios_metal_program_control_mask(hakios_metal_program*, unsigned, uint8_t*) { return 0; }
+
 // FUNCTION of LIBRARY as WANT (a vertex or a fragment function): its bitcode, or nullptr with the reason left
 static bool functionBitcode(hakios_metal_library* l, const char* function, MetalFunction::Type want, const uint8_t** bytes, uint64_t* length) {
     const MetalFunction* f = l->lib.find(function != nullptr ? function : "");

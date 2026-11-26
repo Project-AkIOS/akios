@@ -771,6 +771,9 @@ struct hakios_metal_program {
     // [[buffer(known_binding)]] read as KNOWN (compile_mali.c's mali_compile_known), every compile of it alike
     int known_binding = -1;
     std::vector<uint8_t> known;
+    // (11-26) of a deferred base's specialisation: only these bytes folded (bit a byte, compile_mali.h's control), the
+    // others zero in KNOWN and read at run time; empty: all of them
+    std::vector<uint8_t> known_mask;
 
     void retain() { refs.fetch_add(1); }
     void release()
@@ -1550,7 +1553,8 @@ struct KnownNow {
     explicit KnownNow(const hakios_metal_program *p)
     {
         if (p->known_binding >= 0) {
-            kb = { (unsigned)p->known_binding, p->known.data(), p->known.size() };
+            kb = { (unsigned)p->known_binding, p->known.data(), p->known.size(),
+                   p->known_mask.empty() ? nullptr : p->known_mask.data() };
             mali_compile_known(&kb);
         }
     }
@@ -1560,6 +1564,12 @@ struct KnownNow {
 using namespace mali;   // (it was an anonymous namespace: its names are seen outside it)
 extern "C++" { namespace mali {
 bool compileFetch(hakios_metal_program *p);
+// (11-26) THE CONTENTS SEEN, KEPT: the buffer contents a program's specialisations were made for, in the cache directory
+// as SEENKEY.seen (seenKey: the program as its specialisations' keys have it, without the bytes) -- so that the next
+// boot's plug-in can have them loaded from the cache before the first draw asks (hakios_metal_program_seen_contents)
+uint64_t seenKey(const hakios_metal_program *p);
+void seenNote(const hakios_metal_program *p);
+unsigned seenRead(uint64_t key, unsigned binding, void *bytes, size_t each, unsigned *lengths, unsigned max);
 } }  // namespace mali, extern "C++"
 using namespace mali;   // (it was an anonymous namespace: its names are seen outside it)
 extern "C++" { namespace mali {
