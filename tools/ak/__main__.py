@@ -1,5 +1,6 @@
 """ak: AkIOS's build, boot and flash tool.
 
+  ak toolchain              (re)make .cache/toolchain from tools/toolchain (slow the first time)
   ak kernel                 configure and build the kernel from xnu/ (out/kernel, out/kernel.full)
   ak firmware               build our EDK2 firmware (firmware/ inside .cache/mu-silicium) into out/firmware.img
   ak fwboot NAME            RAM-boot out/firmware.img, wait for the phone to come back to Android, keep its log
@@ -14,7 +15,7 @@
 
 Every run's output goes to [paths] logs/<command>-<time>/.
 """
-import argparse, datetime, os, struct, subprocess, sys, time
+import argparse, datetime, os, re, struct, subprocess, sys, time
 
 from . import adt, bootimg, fat, userland
 
@@ -57,11 +58,51 @@ def say(*a):
 
 
 # ---- kernel -----------------------------------------------------------------------------------------------------------
+TOOLCHAIN = os.path.join(ROOT, '.cache', 'toolchain')    # tools/toolchain's sources + what its setup.sh built
+
+
 def kernel_env():
+    """the environment XNU's make wants on Linux: the cctools and Darwin SDK of theos, our toolchain (wrappers, mig,
+    the kernel's SDK) first in PATH"""
+    t = TOOLCHAIN
     e = dict(os.environ)
-    e.update(XNU_SRC=path('xnu'), RC_DARWIN_KERNEL_VERSION=CONF['kernel']['version'], XNU_IIG_SDK='MacOSX26.1.sdk',
-             XNU_IIG_OVERRIDE=LEGACY + '/xnu-deps/compat-12377/iig', XNU_COMPAT_INC=LEGACY + '/xnu-deps/compat-12377/include')
+    e.update(XNU_SRC=path('xnu'), XNU_HOST_OS='Linux', THEOS=os.environ.get('THEOS', os.path.expanduser('~/theos')),
+             XNUDEPS=t, PATH=os.path.join(t, 'host', 'bin') + ':' + os.environ['PATH'],
+             XNU_SDK_PATH=os.path.join(t, 'sdk', 'iPhoneOS16.5.xnu.sdk'), XNU_SDK_VERSION='16.5',
+             XNU_PLATFORM_PATH=os.path.join(t, 'sdk', 'Platforms', 'iPhoneOS.platform'),
+             RC_DARWIN_KERNEL_VERSION=CONF['kernel']['version'], XNU_IIG_SDK='MacOSX26.1.sdk',
+             XNU_IIG_OVERRIDE=os.path.join(t, 'compat-12377', 'iig'),
+             XNU_COMPAT_INC=os.path.join(t, 'compat-12377', 'include'))
     return e
+
+
+def sync_toolchain():
+    """our toolchain sources (tools/toolchain) into the built tree: what changed there takes effect"""
+    if not os.path.exists(os.path.join(TOOLCHAIN, 'host', 'bin', 'mig')):
+        sys.exit('ak: no toolchain in %s: run `ak toolchain`' % TOOLCHAIN)
+    sh(['rsync', '-a', os.path.join(ROOT, 'tools', 'toolchain') + '/', TOOLCHAIN + '/'])
+
+
+# the make targets that may fail: XNU's last steps make the kernel extensions' symbol sets and check their exports,
+# and fail ("exported name not in import list") for names this machine configuration leaves out (DriverKit's IOService
+# methods, Apple silicon's DART). Nothing here loads a kext. Any other failed target (a compile, a link) fails the build.
+ACCEPTED_FAILURE = re.compile(r'\.symbolset\]|check_all_exports|config_all|_recurse_into_config|\[(Makefile:[0-9]+: )?all\] Error')
+
+
+def unexpected_failures(log):
+    bad = re.compile(r'^make(\[[0-9]+\])?: \*\*\* ')
+    return [l.rstrip() for l in open(log, errors='replace') if bad.match(l) and not ACCEPTED_FAILURE.search(l)]
+
+
+def cmd_toolchain(a):
+    """(re)make .cache/toolchain: our sources, then tools/toolchain/setup.sh there (fetches and builds Apple's open
+    sources, lays out the kernel's SDK; slow the first time)"""
+    log = os.path.join(rundir('toolchain'), 'setup.log')
+    os.makedirs(TOOLCHAIN, exist_ok=True)
+    sh(['rsync', '-a', os.path.join(ROOT, 'tools', 'toolchain') + '/', TOOLCHAIN + '/'])
+    say('setting up the toolchain in', TOOLCHAIN, '(log:', log + ')')
+    sh(['bash', os.path.join(TOOLCHAIN, 'setup.sh')], log=log, env=kernel_env(), cwd=TOOLCHAIN)
+    say('toolchain ready')
 
 
 def kernel_config():
@@ -88,21 +129,30 @@ def cmd_kernel(a):
     log = os.path.join(rundir('kernel'), 'build.log')
     os.umask(0o022)
     kernel_config()
+    sync_toolchain()
     say('building XNU from', path('xnu'), '(log:', log + ')')
-    k = os.path.join(path('xnu'), 'BUILD/obj/%s_ARM64_%s/mach.%s.%s' % (
-        CONF['kernel']['config'], CONF['kernel']['machine'], CONF['kernel']['config'].lower(), CONF['kernel']['machine'].lower()))
-    rc = sh(['./xnu-build.sh', '-k', '-j%d' % os.cpu_count()], log=log, env=kernel_env(), cwd=LEGACY, check=False)
-    # the kext symbol-set checks fail on this configuration and make the status non-zero: make-kernel.sh's judge
-    # accepts a build whose only failures are those
+    m = CONF['kernel']['machine']
+    k = os.path.join(path('xnu'), 'BUILD/obj/%s_ARM64_%s/mach.%s.%s' % (CONF['kernel']['config'], m,
+                                                                     CONF['kernel']['config'].lower(), m.lower()))
+    hostinc = os.path.join(TOOLCHAIN, 'hostinc')
+    # the build tools of SETUP/ are Apple's: on Linux they build with a compatibility header
+    host_cc = ('clang -include %s/hostcompat.h -I%s -Wno-unused-command-line-argument '
+               '-Wno-error=implicit-function-declaration' % (hostinc, hostinc))
+    rc = sh(['make', '-k', '-j%d' % os.cpu_count(), 'SDKROOT=iphoneos', 'ARCH_CONFIGS=ARM64', 'MACHINE_CONFIGS=' + m,
+             'KERNEL_CONFIGS=' + CONF['kernel']['config'], 'ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64', 'BUILD_WERROR=0',
+             'BUILD_LTO=0', 'DO_CTFMERGE=0', 'HOST_CC=' + host_cc, 'HOST_FLEX=flex', 'HOST_BISON=bison', 'HOST_GM4=m4',
+             'CC=xnu-clang', 'CXX=xnu-clang++', 'LOGCOLORS=n'], log=log, env=kernel_env(), cwd=path('xnu'), check=False)
     if rc != 0:
-        e = dict(os.environ, KERNEL=k)
-        if sh(['tools/make-kernel.sh', '--judge', log], env=e, cwd=LEGACY, check=False) != 0:
-            sys.exit('ak: the kernel build failed (status %d), see %s' % (rc, log))
+        bad = unexpected_failures(log)
+        if bad:
+            sys.exit('ak: the kernel build failed (status %d): %s; see %s' % (rc, bad[0][:200], log))
+    if not os.path.exists(k):
+        sys.exit('ak: no kernel was produced (%s); see %s' % (k, log))
     os.makedirs(path('out'), exist_ok=True)
     full, stripped = os.path.join(path('out'), 'kernel.full'), os.path.join(path('out'), 'kernel')
     sh(['cp', '-p', k, full])
     sh(['cp', '-p', k, stripped])
-    sh([LEGACY + '/xnu-deps/host/bin/strip', '-x', stripped])
+    sh([os.path.join(TOOLCHAIN, 'host', 'bin', 'strip'), '-x', stripped])
     say('kernel:', stripped, '(%d bytes)' % os.path.getsize(stripped))
 
 
@@ -341,6 +391,7 @@ def main():
     p = argparse.ArgumentParser(prog='ak', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     s = p.add_subparsers(dest='cmd', required=True)
     s.add_parser('kernel').set_defaults(f=cmd_kernel)
+    s.add_parser('toolchain').set_defaults(f=cmd_toolchain)
     s.add_parser('loader').set_defaults(f=cmd_loader)
     u = s.add_parser('userland'); u.add_argument('--oslog', help='launchd labels (comma-separated) whose logs go to the console')
     u.set_defaults(f=cmd_userland)
