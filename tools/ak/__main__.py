@@ -275,7 +275,7 @@ def cmd_esp(a):
         line += ' rd=md0'
     serial = open(os.path.expanduser('~/akita/usb_serial')).readline().strip()
     ramdisk = os.path.expanduser(a.initrd or esp_ramdisk())
-    tree = adt.build(line, IPHONE_TREE, serial, ramdisk=True)
+    tree = adt.build(line, IPHONE_TREE, serial, ramdisk=True, defaults=' '.join(CONF['kernel']['default_args']))
     open(os.path.join(out, 'kernel.adt'), 'wb').write(tree)
     files = {
         'EFI/BOOT/BOOTAA64.EFI': rd(os.path.join(lo, 'UniXNU.efi')),

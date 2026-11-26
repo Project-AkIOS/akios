@@ -135,6 +135,14 @@ def identity(im4p):
         # wifid only on a device tree with a node of this name (its job's _LimitLoadToDeviceTree)
         'wlan': kept(next(c for c in children['arm-io'][1] if name_of(c) == 'wlan')[0],
                      own + ('local-mac-address', 'audio-protection-driver')),
+        # (11-26) arm-io/bluetooth: the node bluetoothd and BlueTool find the controller by (IOServiceNameMatching
+        # "bluetooth"; AppleBluetoothModule matches it by name). Without the iPhone's wiring: its interrupt, its
+        # register and its GPIO functions (function-*) point into the iPhone's AOP and GPIO blocks; the transport is
+        # build()'s to say, the address ours
+        'bluetooth': [(n, v) for n, v in kept(next(c for c in children['arm-io'][1] if name_of(c) == 'bluetooth')[0],
+                                              own + ('interrupt-parent', 'interrupts', 'reg', 'local-mac-address',
+                                                     'transport-encoding', 'transport-speed'))
+                      if not n.startswith('function-')],
     }
 
 
@@ -213,8 +221,17 @@ def word(line, prefix):
     return any(w.startswith(prefix) for w in line.split())
 
 
-def build(line, im4p, serial, ramdisk=True, plat=AKITA, window=WINDOW):
-    """kernel.adt for boot line LINE (it decides cores, torch, camera as for xnuloader)"""
+def boot_arg(line, name, default=0):
+    """the number of boot-arg NAME=N in LINE, DEFAULT without one"""
+    for w in line.split():
+        if w.startswith(name + '=') and w[len(name) + 1:].isdigit():
+            return int(w[len(name) + 1:])
+    return default
+
+
+def build(line, im4p, serial, ramdisk=True, plat=AKITA, window=WINDOW, defaults=''):
+    """kernel.adt for boot line LINE (it decides cores, torch, camera as for xnuloader); DEFAULTS: the kernel's built-in
+    arguments (akios.toml [kernel] default_args), for what the line does not name (bt)"""
     ident = identity(im4p)
     more_cores = word(line, 'cpus=') or word(line, 'cpumask=')
     torch = any(w.startswith('torch=') and w[6:7] in '123456789' and w[6:7] != '' for w in line.split())
@@ -319,6 +336,15 @@ def build(line, im4p, serial, ramdisk=True, plat=AKITA, window=WINDOW):
     wlan = arm_io.child(Node('wlan'))
     from_iphone(wlan, ident['wlan'])
     wlan.prop('local-mac-address', ids['wifi'])
+    if boot_arg(line, 'bt', boot_arg(defaults, 'bt')) >= 2:
+        # (11-26) only when the kernel gives the controller to iOS (bt=2): with the node there bluetoothd starts and
+        # waits for a controller. transport-encoding 3 is H4BC (the kernel control com.apple.uart.sk.bluetooth and a
+        # Skywalk pipe), a UART iPhone's transport: the BCM4383 really is on a UART (the iPhone 13's 7 is PCIe). No
+        # transport-speed: the kernel already runs the UART at 4 Mbaud, and bluetoothd would try to set its own
+        bluetooth = arm_io.child(Node('bluetooth'))
+        from_iphone(bluetooth, ident['bluetooth'])
+        bluetooth.prop('transport-encoding', u32(3))
+        bluetooth.prop('local-mac-address', ids['bluetooth'])     # = /chosen/mac-address-bluetooth0
     gic = arm_io.child(Node('gic'))
     gic.prop('device_type', cstr('interrupt-controller'))
     gic.prop('compatible', cstr('arm,gic-v3'))
