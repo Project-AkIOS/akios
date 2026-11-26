@@ -257,7 +257,7 @@ def esp_ramdisk():
     return new if os.path.exists(new) else LEGACY + '/userland/root.apfs'
 
 
-IPHONE_TREE = LEGACY + '/sysimage-d16ap/DeviceTree.d16ap.im4p'   # whose identity Darwin's user space gets
+IPHONE_TREE = os.path.join(CONF['userland']['ipsw'].replace('~', os.path.expanduser('~'), 1), 'DeviceTree.d16ap.im4p')   # whose identity Darwin's user space gets
 
 
 def cmd_esp(a):

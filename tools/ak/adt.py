@@ -370,7 +370,7 @@ if __name__ == '__main__':
     a = argparse.ArgumentParser(description='kernel.adt for DarwinBoot')
     a.add_argument('out')
     a.add_argument('--line', default='cpus=9 torch=3')
-    a.add_argument('--im4p', default=os.path.expanduser('~/akita/hakios-base/sysimage-d16ap/DeviceTree.d16ap.im4p'))
+    a.add_argument('--im4p', default=os.path.expanduser('~/akita/akios-data/ipsw-d16ap/DeviceTree.d16ap.im4p'))
     a.add_argument('--serial-file', default=os.path.expanduser('~/akita/usb_serial'))
     a.add_argument('--no-ramdisk', action='store_true')
     a.add_argument('--dump', action='store_true')

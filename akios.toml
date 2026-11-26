@@ -36,8 +36,8 @@ sdk_target   = "16.5"                                        # xnu-clang's -targ
 sdk          = "~/theos/sdks/iPhoneOS27.2.sdk"
 arch         = "arm64e"
 ldid         = "~/theos/toolchain/linux/iphone/bin/ldid"
-ipsw         = "~/akita/hakios-base/sysimage-d16ap"         # the unpacked IPSW: rootfs/ (launchd jobs), var.skel, build.conf
-firmware     = "~/akita/hakios-base"                        # its fw-*/: the vendor's files, never in git
+ipsw         = "~/akita/akios-data/ipsw-d16ap"              # the unpacked IPSW: rootfs/ (launchd jobs), var.skel, build.conf
+firmware     = "~/akita/akios-data/firmware"                # its fw-*/: the vendor's files, never in git
 ca_share     = "~/ca-share"                                  # QuartzCore's default.metallib (tools/ca-metallib.py)
 # (transition) still in the old tree: Metal (its own repository later) and the APFS tools
 metal        = "~/akita/hakios-base/hakios-metal"
