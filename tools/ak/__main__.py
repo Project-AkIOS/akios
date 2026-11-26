@@ -33,7 +33,6 @@ def path(key):
     return p if os.path.isabs(p) else os.path.join(ROOT, p)
 
 
-LEGACY = path('legacy')
 
 
 def rundir(cmd):
@@ -360,7 +359,7 @@ def to_bootloader():
     if in_android():
         subprocess.run(['adb', 'reboot', 'bootloader'])
     elif in_ios():
-        subprocess.run(['python3', LEGACY + '/devices/akita/tools/usbmux-reboot.py', 'bootloader'])
+        subprocess.run(['python3', os.path.join(ROOT, 'tools', 'phone', 'usbmux-reboot.py'), 'bootloader'])
     for _ in range(40):
         if in_fastboot():
             return
@@ -376,7 +375,7 @@ def cmd_status(a):
 
 def usbmux_log(dest, kernel=False, secs=15):
     with open(dest, 'w') as f:
-        subprocess.run(['timeout', str(secs), 'python3', LEGACY + '/devices/akita/tools/usbmux-log.py'] + (['-k'] if kernel else []),
+        subprocess.run(['timeout', str(secs), 'python3', os.path.join(ROOT, 'tools', 'phone', 'usbmux-log.py')] + (['-k'] if kernel else []),
                        stdout=f, stderr=subprocess.STDOUT)
 
 

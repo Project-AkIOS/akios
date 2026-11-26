@@ -4,8 +4,6 @@
 xnu      = "xnu"                       # our XNU fork (Apple's tag first, our commits on top)
 out      = "out"                       # what ak makes: kernel, images
 logs     = "~/akita/logs/ak"           # one directory a run
-# (transition) what has not moved yet comes from the old tree
-legacy   = "~/akita/hakios-base"
 
 [kernel]
 config   = "DEVELOPMENT"
