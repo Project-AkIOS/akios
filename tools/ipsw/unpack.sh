@@ -1,0 +1,175 @@
+#!/bin/bash
+# Unpack the files of Darwin userland 16.5 (20F66, iPhone X) that the system image is made of, out of an IPSW
+# you have on your own disk, and lay them out the way ../userland/build.sh expects them:
+#
+#   rootfs/                  the chosen part of the root filesystem (see select-system.py)
+#   system.files/.manifest   what was chosen, with owners, modes and symbolic links
+#   var.skel                 the skeleton of /private/var (see mkvarskel.py)
+#   cryptex/                 the OS cryptex without the dyld shared cache
+#   cryptex-app.dmg          the App cryptex as it is in the IPSW (10 MB, an APFS container: Safari's
+#                            daemons, its settings and the bundles around it, which the root volume's
+#                            launchd jobs and links reach through /System/Cryptexes/App)
+#   cryptex-app/             ... and its files
+#   20F66__iPhone10,3_6/     the dyld shared cache (arm64)
+#   DeviceTree.d22ap.im4p    the device tree, for ../xnuloader/mkidentity.sh
+#
+# The project ships no file of Apple's and downloads none. The IPSW is yours: get
+# iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw yourself (6 165 698 198 bytes) and give its path:
+#
+#   sysimage/unpack.sh ~/Downloads/iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw
+#   IPSW=... sysimage/unpack.sh              the same, from the environment (make unpack IPSW=...)
+#
+# The disk images are copied out of the IPSW (ipsw-member.py) and unpacked with 7z. Needs: python3,
+# 7z (7-Zip 23 or newer: it reads APFS), cc. About 8 GB of disk while it runs, 5.3 GB afterwards.
+#
+#   KEEP=1   keep the copied disk images (rootfs.dmg is needed again only after changing
+#            select-system.py; with it in place a second run does not read the IPSW for it)
+set -e
+IPSW=${1:-${IPSW:-}}
+if [ -z "$IPSW" ]; then
+	sed -n '16,20p' "$0" | sed 's/^# \{0,1\}//' >&2
+	echo "unpack.sh: give the path of your Darwin userland 16.5 IPSW" >&2
+	exit 1
+fi
+[ -f "$IPSW" ] || { echo "unpack.sh: $IPSW: no such file" >&2; exit 1; }
+IPSW=$(cd "$(dirname "$IPSW")" && pwd)/$(basename "$IPSW")
+size=$(wc -c < "$IPSW" | tr -d ' ')
+# THE BUILDS THIS KNOWS (by the IPSW's size; the names are its BuildManifest's OS, Cryptex1,SystemOS and Cryptex1,AppOS
+# for d22ap): 16.5 20F66, which upstream HakiOS is built around, and 16.7.16 20H392 (2026-11-13, the Pixel 8a's tester:
+# the newest the iPhone X has). What is unpacked says which it is in build.conf, which ../userland/build.sh reads.
+# (akios: the helpers are beside this script; what is unpacked goes to OUT, default ~/akita/akios-data/ipsw-new)
+HERE=$(cd "$(dirname "$0")" && pwd)
+AKIOS=$(cd "$HERE/../.." && pwd)
+OUT=${OUT:-$HOME/akita/akios-data/ipsw-new}
+mkdir -p "$OUT" && cd "$OUT"
+case "$size" in
+6165698198)
+	BUILD=20F66 VERSION=16.5 DEVICE=d22ap MODEL=iPhone10,3_6 ARCH=arm64
+	ROOTFS_DMG=096-04088-077.dmg                    # the root filesystem, APFS
+	CRYPTEX_DMG=096-04666-078.dmg                   # the OS cryptex: dyld shared cache and a few libraries
+	APP_CRYPTEX_DMG=096-03536-083.dmg               # the App cryptex (BuildManifest: Cryptex1,AppOS)
+	;;
+6171035648)
+	BUILD=20H392 VERSION=16.7.16 DEVICE=d22ap MODEL=iPhone10,3_6 ARCH=arm64
+	ROOTFS_DMG=087-86698-044.dmg
+	CRYPTEX_DMG=087-86593-047.dmg
+	APP_CRYPTEX_DMG=087-86715-047.dmg
+	;;
+6755700733)
+	# iPhone 13 mini (iPhone14,4, d16ap), iOS 16.6.1 20G81 -- the arm64e stepping stone (rebase-13mini.md).
+	# The dyld shared cache is arm64e; member names verified against this IPSW's BuildManifest, 2026-11-16.
+	BUILD=20G81 VERSION=16.6.1 DEVICE=d16ap MODEL=iPhone14,4 ARCH=arm64e
+	ROOTFS_DMG=096-57815-083.dmg                    # OS (the root filesystem, APFS)
+	CRYPTEX_DMG=096-57245-083.dmg                   # Cryptex1,SystemOS (dyld shared cache, arm64e)
+	APP_CRYPTEX_DMG=096-57613-084.dmg               # Cryptex1,AppOS
+	;;
+11440848869)
+	# iPhone 13 mini (iPhone14,4, d16ap), iOS 27.2.1 24B156 (2026-11-20, the tester's choice). Kernel xnu-13432.42.3.
+	# The root filesystem and the OS cryptex are encrypted (.dmg.aea): aea-decrypt.py opens them with the key
+	# Apple publishes for released builds (the URL is in each file).
+	BUILD=24B156 VERSION=27.2.1 DEVICE=d16ap MODEL=iPhone14,4 ARCH=arm64e
+	ROOTFS_DMG=141-09352-223.dmg.aea                # OS
+	CRYPTEX_DMG=141-08508-235.dmg.aea               # Cryptex1,SystemOS
+	APP_CRYPTEX_DMG=141-08824-252.dmg               # Cryptex1,AppOS
+	;;
+*)
+	echo "unpack.sh: $IPSW is $size bytes: not a build this knows --" >&2
+	echo "  16.5 20F66 (6165698198) or 16.7.16 20H392 (6171035648) for iPhone10,3/10,6 (d22ap, arm64)," >&2
+	echo "  or 16.6.1 20G81 (6755700733) / 27.2.1 24B156 (11440848869) for iPhone14,4 (d16ap, arm64e)." >&2
+	exit 1
+	;;
+esac
+CACHE=${BUILD}__${MODEL}
+if [ -f build.conf ] && ! grep -q "^BUILD=$BUILD\$" build.conf; then
+	echo "unpack.sh: this directory holds $(grep '^BUILD=' build.conf) -- move it away first (rootfs cryptex cryptex-app *__iPhone* .done-* build.conf ...)" >&2
+	exit 1
+fi
+printf 'BUILD=%s\nVERSION=%s\nCACHE=%s\nDEVICE=%s\nMODEL=%s\nARCH=%s\n' "$BUILD" "$VERSION" "$CACHE" "$DEVICE" "$MODEL" "$ARCH" > build.conf
+UNZBM=$AKIOS/.cache/toolchain/host/bin/unzbm
+member() { # member NAME OUT: copy a disk image out of the IPSW, decrypting an .aea one
+	case "$1" in
+	*.aea) python3 "$HERE/aea-decrypt.py" "$IPSW" "$1" "$2" ;;
+	*) python3 "$HERE/ipsw-member.py" "$IPSW" "$1" "$2" ;;
+	esac
+}
+
+for tool in python3 7z cc; do
+	command -v $tool >/dev/null || { echo "unpack.sh: $tool is not installed"; exit 1; }
+done
+# 7z leaves files compressed with LZBITMAP as an empty file and two attribute files; unzbm finishes them
+if [ ! -x $UNZBM ]; then
+	mkdir -p "$(dirname $UNZBM)"
+	cc -O2 -w -o $UNZBM $AKIOS/tools/toolchain/build/lzbitmap/unzbm.c $AKIOS/tools/toolchain/build/lzbitmap/libzbitmap.c
+fi
+unzbm_all() { # unzbm_all DIR: expand every LZBITMAP file below DIR
+	find "$1" -type f -name '*:com.apple.decmpfs' | sed 's/:com\.apple\.decmpfs$//' | tr '\n' '\0' | xargs -0 -r -n 200 $UNZBM
+	local left
+	left=$(find "$1" -name '*:com.apple.*' | wc -l)
+	[ "$left" -eq 0 ] || { echo "unpack.sh: $left files in $1 are still compressed"; exit 1; }
+}
+
+# --- the root filesystem --------------------------------------------------------------------------
+if [ ! -f .done-rootfs ] || [ select-system.py -nt .done-rootfs ]; then
+	if [ ! -f rootfs.dmg ]; then
+		echo "unpack.sh: copying the root filesystem image out of the IPSW (4.7 GB)"
+		member $ROOTFS_DMG rootfs.dmg.part
+		mv rootfs.dmg.part rootfs.dmg
+	fi
+	echo "unpack.sh: listing the image"
+	7z l -slt rootfs.dmg > rootfs.slt
+	python3 "$HERE/select-system.py" rootfs.slt system.files system.manifest
+	python3 "$HERE/mkvarskel.py" rootfs.slt > var.skel
+	echo "unpack.sh: extracting $(wc -l < system.files) files"
+	rm -rf rootfs
+	7z x -y -orootfs rootfs.dmg @system.files > extract-system.log
+	# the two fonts too big for the image as they are, made smaller in place (see select-system.py)
+	python3 "$HERE/font_trim.py" emoji rootfs/System/Library/Fonts/CoreAddition/AppleColorEmoji-160px.ttc \
+		rootfs/System/Library/Fonts/CoreAddition/AppleColorEmoji-160px.ttc 40,64,96
+	# (iOS 27 has no LanguageSupport/PingFang.ttc: its CJK UI font is FontServices' PingFangUI.ttc)
+	PF=rootfs/System/Library/Fonts/LanguageSupport/PingFang.ttc
+	[ ! -f $PF ] || python3 "$HERE/font_trim.py" faces $PF $PF '^\.?PingFang(SC|TC|HK)-(Regular|Semibold)$'
+	touch .done-rootfs
+	[ -n "$KEEP" ] || rm -f rootfs.dmg
+fi
+
+# --- the OS cryptex -------------------------------------------------------------------------------
+if [ ! -f .done-cryptex ]; then
+	if [ ! -f cryptex-os.dmg ]; then
+		echo "unpack.sh: copying the OS cryptex image out of the IPSW (2.7 GB)"
+		member $CRYPTEX_DMG cryptex-os.dmg.part
+		mv cryptex-os.dmg.part cryptex-os.dmg
+	fi
+	echo "unpack.sh: extracting the cryptex"
+	rm -rf cryptex cryptex.cache $CACHE
+	# 7z reports every LZBITMAP file as an error ("Unsupported Method"): expected, unzbm_all checks the result
+	7z x -y -ocryptex cryptex-os.dmg '-xr!com.apple.dyld' '-x!System/DriverKit' > extract-cryptex.log 2>&1 || true
+	unzbm_all cryptex
+	# the dyld shared cache; its .symbols file (0.6 GB) is never mapped and is left out
+	7z x -y -ocryptex.cache cryptex-os.dmg System/Library/Caches/com.apple.dyld '-xr!*.symbols*' > extract-dyld.log 2>&1 || true
+	unzbm_all cryptex.cache
+	mv cryptex.cache/System/Library/Caches/com.apple.dyld $CACHE
+	rm -rf cryptex.cache
+	[ "$(ls $CACHE | wc -l)" -ge 40 ] || { echo "unpack.sh: the dyld shared cache is incomplete"; exit 1; }
+	touch .done-cryptex
+	[ -n "$KEEP" ] || rm -f cryptex-os.dmg
+fi
+
+# --- the App cryptex ------------------------------------------------------------------------------
+# kept as it is (the boot off the flash puts it in memory unchanged, ../userland/build.sh FLASHBOOT=1)
+# and unpacked (the system image has its files at /System/Cryptexes/App)
+if [ ! -f .done-cryptex-app ]; then
+	if [ ! -f cryptex-app.dmg ]; then
+		echo "unpack.sh: copying the App cryptex image out of the IPSW (10 MB)"
+		member $APP_CRYPTEX_DMG cryptex-app.dmg.part
+		mv cryptex-app.dmg.part cryptex-app.dmg
+	fi
+	echo "unpack.sh: extracting the App cryptex"
+	rm -rf cryptex-app
+	7z x -y -ocryptex-app cryptex-app.dmg > extract-cryptex-app.log 2>&1 || true
+	unzbm_all cryptex-app
+	[ -f cryptex-app/usr/libexec/webbookmarksd ] || { echo "unpack.sh: the App cryptex is incomplete"; exit 1; }
+	touch .done-cryptex-app
+fi
+# --- the device tree, for xnuloader/mkidentity.sh -----------------------------------------------
+[ -f DeviceTree.$DEVICE.im4p ] || python3 "$HERE/ipsw-member.py" "$IPSW" Firmware/all_flash/DeviceTree.$DEVICE.im4p DeviceTree.$DEVICE.im4p
+echo "unpack.sh: done: $(du -sh rootfs | cut -f1) rootfs, $(du -sh cryptex | cut -f1) cryptex, $(du -sh cryptex-app | cut -f1) App cryptex, $(du -sh $CACHE | cut -f1) dyld shared cache"
