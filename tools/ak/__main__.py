@@ -6,12 +6,9 @@
   ak userland [--oslog L,..] build out/akios.apfs, the RAM disk the kernel starts from, out of userland/ (its
                             userland.toml; --oslog: those launchd jobs log to the console)
   ak loader                 build the UEFI loader from loader/ (out/loader: AkiosBoot.efi, DarwinBoot.efi, Fat.efi)
-  ak image [--flash] [--new-loader] [ARGS]
-                            make a boot image from out/kernel and the current userland (out/test.img, or with
-                            --flash out/flash.img: no kill switches); ARGS are extra boot arguments
-  ak boot NAME [ARGS]       RAM-boot out/test.img (built first) and keep the console and kernel log
-                            (--stay: leave it running; --quiet: restarts into the bootloader; --speaker: sound on)
-  ak flash                  build out/flash.img and write it to the flash slot (akios.toml [flash]), make it active
+  ak esp [--quiet] [--flash] [ARGS]
+                            out/esp.img + esp.simg: the ESP our firmware boots from (UniXNU, DarwinBoot, the kernel,
+                            its device tree, out/akios.apfs); `fastboot flash esp out/esp.simg` writes it
   ak log [--kernel]         the phone's console log (or kernel log) over the cable
   ak status                 where the phone is: fastboot, Android (adb) or iOS (usbmux)
 
@@ -19,7 +16,7 @@ Every run's output goes to [paths] logs/<command>-<time>/.
 """
 import argparse, datetime, os, struct, subprocess, sys, time
 
-from . import adt, fat, userland
+from . import adt, bootimg, fat, userland
 
 try:
     import tomllib
@@ -136,8 +133,7 @@ def cmd_firmware(a):
     os.makedirs(out, exist_ok=True)
     open(os.path.join(out, 'firmware-kernel'), 'wb').write(kernel)
     img = os.path.join(out, 'firmware.img')
-    sh(['python3', LEGACY + '/tools/mkubootimg.py', '-d', CONF['phone']['name'], '-u', os.path.join(out, 'firmware-kernel'),
-        '--no-ramdisk', '-o', img], log=log)
+    open(img, 'wb').write(bootimg.firmware_image(bytes(kernel)))
     say('firmware image:', img)
 
 
@@ -199,15 +195,6 @@ def cmd_loader(a):
     say('loader:', out)
 
 
-def payload(items):
-    """the boot payload U-Boot copies to 0xF0000000: "XNUP", then name[16]/size/reserved/data entries"""
-    body = b''
-    for name, data in items:
-        body += struct.pack('<16sII', name.encode(), len(data), 0) + data + b'\0' * (-len(data) % 16)
-    body += b'\0' * 32
-    return struct.pack('<II', 0x50554E58, len(body)) + body
-
-
 def akios_toml(line, failsafe, initrd=None):
     q = lambda v: '"%s"' % v.replace('\\', '\\\\').replace('"', '\\"')
     return '\n'.join([
@@ -220,31 +207,6 @@ def akios_toml(line, failsafe, initrd=None):
         '[[entry]]', 'id = "reset"', 'title = "Restart"', 'type = "action"', 'action = "reset"', ''])
 
 
-def make_new_image(flash, line, name):
-    """the new loader's image: U-Boot starts AkiosBoot.efi; the payload has Fat.efi and the ESP image"""
-    out, lo = path('out'), os.path.join(path('out'), 'loader')
-    for f in ('AkiosBoot.efi', 'DarwinBoot.efi', 'Fat.efi'):
-        if not os.path.exists(os.path.join(lo, f)):
-            sys.exit('ak: no out/loader/%s: run `ak loader` first' % f)
-    failsafe = 0 if flash else CONF['test'].get('loader_failsafe', 120)
-    rd = lambda f: open(f, 'rb').read()
-    esp = fat.make_fat({
-        'EFI/UniXNU/akios.toml': akios_toml(line, failsafe).encode(),
-        'EFI/UniXNU/DarwinBoot.efi': rd(os.path.join(lo, 'DarwinBoot.efi')),
-        'EFI/UniXNU/kernel': rd(os.path.join(out, 'kernel')),
-    })
-    open(os.path.join(out, name + '-esp.img'), 'wb').write(esp)
-    items = [('fat', rd(os.path.join(lo, 'Fat.efi'))), ('esp', esp)]
-    if failsafe:
-        items.append(('failsafe', b'%d\0' % failsafe))
-    pl = os.path.join(out, name + '-payload.bin')
-    open(pl, 'wb').write(payload(items))
-    img = os.path.join(out, name + '.img')
-    sh(['python3', LEGACY + '/tools/mkubootimg.py', '-d', CONF['phone']['name'], '-l', os.path.join(lo, 'AkiosBoot.efi'),
-        '-p', pl, '-o', img], log='/dev/null')
-    return img
-
-
 # ---- the ESP (our firmware's boot volume, the phone's "esp" partition) --------------------------------------------
 ESP_BYTES = 512 << 20
 
@@ -254,7 +216,9 @@ ESP_BYTES = 512 << 20
 # volume, and root.apfs as md1; DarwinBoot places one); --initrd picks another
 def esp_ramdisk():
     new = os.path.join(path('out'), 'akios.apfs')
-    return new if os.path.exists(new) else LEGACY + '/userland/root.apfs'
+    if not os.path.exists(new):
+        sys.exit('ak: no out/akios.apfs: run `ak userland` first')
+    return new
 
 
 IPHONE_TREE = os.path.join(CONF['userland']['ipsw'].replace('~', os.path.expanduser('~'), 1), 'DeviceTree.d16ap.im4p')   # whose identity Darwin's user space gets
@@ -318,33 +282,6 @@ def cmdline(flash, extra, quiet, speaker=False):
     return line
 
 
-def make_image(flash, extra, quiet, speaker=False, new_loader=False):
-    out = path('out')
-    kernel = os.path.join(out, 'kernel')
-    if not os.path.exists(kernel):
-        sys.exit('ak: no out/kernel: run `ak kernel` first')
-    name = 'flash' if flash else 'test'
-    payload, img = os.path.join(out, name + '-payload.bin'), os.path.join(out, name + '.img')
-    line = cmdline(flash, extra, quiet, speaker)
-    if new_loader:
-        img = make_new_image(flash, line, name)
-        open(os.path.join(out, name + '.cmdline'), 'w').write(line + '\n')
-        say(name + ' image (new loader):', img)
-        return img
-    sh(['python3', LEGACY + '/xnuloader/mkpayload.py', '-o', payload, 'kernel=' + kernel,
-        'ramdisk=' + LEGACY + '/userland/root.apfs', 'resident=' + LEGACY + '/userland/flashboot.apfs', '--cmdline', line],
-       log='/dev/null')
-    sh(['python3', LEGACY + '/tools/mkubootimg.py', '-d', CONF['phone']['name'], '-p', payload, '-o', img], log='/dev/null')
-    open(os.path.join(out, name + '.cmdline'), 'w').write(line + '\n')
-    say(name + ' image:', img)
-    return img
-
-
-def cmd_image(a):
-    make_image(a.flash, a.args, a.quiet or (not a.flash and quiet_now()), a.speaker, a.new_loader)
-
-
-# ---- the phone --------------------------------------------------------------------------------------------------------
 def fastboot(*args, timeout=60):
     return subprocess.run(['fastboot'] + list(args), capture_output=True, text=True, timeout=timeout)
 
@@ -393,40 +330,6 @@ def usbmux_log(dest, kernel=False, secs=15):
                        stdout=f, stderr=subprocess.STDOUT)
 
 
-def cmd_boot(a):
-    quiet = a.quiet or quiet_now()
-    img = make_image(False, a.args, quiet, a.speaker, a.new_loader)
-    d = rundir('boot-' + a.name)
-    to_bootloader()
-    if fastboot('getvar', 'current-slot').stderr.find('current-slot: ' + CONF['flash']['slot']) >= 0:
-        sys.exit('ak: slot %s is active, and the bootloader ignores RAM boots then (`fastboot set_active a`, with the owner\'s word)'
-                 % CONF['flash']['slot'])
-    r = fastboot('boot', img, timeout=120)
-    if r.returncode != 0:
-        sys.exit('ak: fastboot boot failed: ' + r.stderr.strip()[-200:])
-    t0 = time.time()
-    while time.time() - t0 < 180 and not in_ios():
-        time.sleep(3)
-    say('usbmux after %d s' % (time.time() - t0) if in_ios() else 'no usbmux in 180 s (is the PC\'s usbmuxd running?)')
-    time.sleep(max(0, a.wait - (time.time() - t0)))
-    usbmux_log(os.path.join(d, 'console.txt'))
-    usbmux_log(os.path.join(d, 'klog.txt'), kernel=True, secs=12)
-    say('logs in', d)
-    if not a.stay:
-        subprocess.run(['python3', LEGACY + '/devices/akita/tools/usbmux-reboot.py', 'bootloader'])
-
-
-def cmd_flash(a):
-    img = make_image(True, a.args, False)
-    to_bootloader()
-    slot = CONF['flash']['slot']
-    for args in (['flash', 'boot_' + slot, img], ['set_active', slot]):
-        r = fastboot(*args, timeout=180)
-        if r.returncode != 0:
-            sys.exit('ak: fastboot %s failed: %s' % (' '.join(args), r.stderr.strip()[-200:]))
-    say('boot_%s written from %s and made active; `fastboot reboot` starts it' % (slot, img))
-
-
 def cmd_log(a):
     d = rundir('log')
     dest = os.path.join(d, 'klog.txt' if a.kernel else 'console.txt')
@@ -444,18 +347,10 @@ def main():
     s.add_parser('firmware').set_defaults(f=cmd_firmware)
     e = s.add_parser('esp'); e.add_argument('--quiet', action='store_true'); e.add_argument('--speaker', action='store_true')
     e.add_argument('--flash', action='store_true', help='the unplugged image: no kill switches, no test arguments')
-    e.add_argument('--initrd', help='the RAM disk (default: out/akios.apfs, else the legacy tree\'s userland/root.apfs)')
+    e.add_argument('--initrd', help='the RAM disk (default: out/akios.apfs)')
     e.add_argument('args', nargs='*'); e.set_defaults(f=cmd_esp)
     w = s.add_parser('fwboot'); w.add_argument('name'); w.add_argument('--wait', type=int, default=300)
     w.set_defaults(f=cmd_fwboot)
-    i = s.add_parser('image'); i.add_argument('--flash', action='store_true'); i.add_argument('--quiet', action='store_true')
-    i.add_argument('--speaker', action='store_true'); i.add_argument('--new-loader', action='store_true')
-    i.add_argument('args', nargs='*'); i.set_defaults(f=cmd_image)
-    b = s.add_parser('boot'); b.add_argument('name'); b.add_argument('--stay', action='store_true')
-    b.add_argument('--quiet', action='store_true'); b.add_argument('--wait', type=int, default=60)
-    b.add_argument('--speaker', action='store_true'); b.add_argument('--new-loader', action='store_true')
-    b.add_argument('args', nargs='*'); b.set_defaults(f=cmd_boot)
-    f = s.add_parser('flash'); f.add_argument('args', nargs='*'); f.set_defaults(f=cmd_flash)
     l = s.add_parser('log'); l.add_argument('--kernel', action='store_true'); l.add_argument('--secs', type=int, default=15)
     l.set_defaults(f=cmd_log)
     s.add_parser('status').set_defaults(f=cmd_status)
