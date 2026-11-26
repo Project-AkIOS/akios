@@ -1,4 +1,8 @@
-# akios.toml: what `ak` builds, boots and flashes. Paths are relative to this directory unless absolute (~ allowed).
+# akios.toml: what `ak` builds, boots and flashes, the same for every device. Paths are relative to this directory unless
+# absolute (~ allowed). Each device's own settings are in devices/<name>/device.toml, merged over this (devices/README.md).
+
+# the device ak works for unless told otherwise (ak --device NAME ..., or AKIOS_DEVICE=NAME)
+device = "akita"
 
 [paths]
 xnu      = "xnu"                       # our XNU fork (Apple's tag first, our commits on top)
@@ -9,21 +13,7 @@ logs     = "~/akita/logs/ak"           # one directory a run
 config   = "DEVELOPMENT"
 machine  = "BCM2837"                   # the slot our platform builds in
 version  = "25.6.0"                    # RC_DARWIN_KERNEL_VERSION
-# the drivers built in (one build option each); ak writes config/MASTER.hakios and bsd/dev/hakios.drivers.h from this
-drivers  = [
-  "guard", "bt_host", "battery", "ufs", "wifi_station",
-  "akita_aoc", "akita_amp", "akita_bt", "akita_torch", "akita_camera", "akita_display", "akita_gnss", "akita_mali",
-  "akita_haptic", "akita_keys", "akita_touch", "akita_modem", "akita_battery", "akita_acpm", "akita_thermal",
-  "akita_dvfs", "akita_rtc", "akita_power", "akita_mct", "akita_trusty", "akita_usb", "akita_wifi",
-]
-# what the kernel assumes when the boot line does not name an argument (pexpert/arm/pe_bootargs.c)
-default_args = [
-  "touchscreen=1", "buttons=1", "fuelgauge=1", "usbmux=1", "thermal=1", "dvfs=1", "mali_keep=1", "metal=1",
-  "metal_plugin=../../../akita/lib/HakiosMetal", "display_flip=1", "metal_all=1",
-  "root_apfs=ufs_ios_system", "var_hfs=ufs_ios_data", "cryptex_dev=ufs_ios_preboot",
-  "pcie=5", "pcie_delay=10", "wifi=8", "aoc=3", "amp=2", "speaker=1", "amp_gain=17", "aocrec=1", "fb_beat=0",
-  "cpuidle=1", "bt=2",
-]
+# drivers and default_args: the device's ([kernel] of devices/<name>/device.toml)
 
 [userland]
 # `ak userland`: the repository (userland/userland.toml says what goes into out/akios.apfs) and what it is built with.
@@ -35,7 +25,7 @@ sdk          = "~/theos/sdks/iPhoneOS27.2.sdk"
 arch         = "arm64e"
 ldid         = "~/theos/toolchain/linux/iphone/bin/ldid"
 ipsw         = "~/akita/akios-data/ipsw-d16ap"              # the unpacked IPSW: rootfs/ (launchd jobs), var.skel, build.conf
-firmware     = "~/akita/akios-data/firmware"                # its fw-*/: the vendor's files, never in git
+# firmware: the device's own (its data directory's firmware/, the vendor's files, never in git)
 ca_share     = "~/ca-share"                                  # QuartzCore's default.metallib (tools/ca-metallib.py)
 metal        = "metal"
 metal_plugin = "metal/ca-plugin"                          # HakiosMetalCA.m, HakiosMetal.plist (the old plug-in)
@@ -52,16 +42,7 @@ symbols     = "~/akita/ref/symbols-24B156"                # iOS 24B156 Symbols s
 symbols_db  = "~/akita/ref/symbols-24B156.sqlite"         # its symbol database: syms(addr, name, ...), images(path, ...)
 
 [phone]
-name     = "akita"
-# the command line every boot gets
-cmdline  = [
-  "debug=0x8", "cpus=9", "ufs=2", "ufs_write=1", "torch=3", "hakios_arm64e=1",
-  "wifi=8", "pcie=5",
-  "ca_metallib=/akita/share/ca-share/QuartzCore-default.metallib",
-  "display_hz=120", "fbwidth=1080", "fbheight=2340", "fbscale=3", "fbsubtype=2340", "fb_zc=1", "anim_max=1",
-  "metal=1", "metal_plugin=../../../akita/lib/HakiosMetal", "metal_all=1", "mali_keep=1", "display_flip=1",
-  "dvfs=1", "thermal=1", "skip_setup=1",
-]
+# cmdline: the device's ([phone] of devices/<name>/device.toml)
 # the boot line is cut at about 1000 characters: past this, ak refuses to build an image
 cmdline_max = 900
 
@@ -73,7 +54,7 @@ test_reboot_after = 1200               # s after boot
 quiet_hours       = [22, 9]            # local time: speaker=0, restart into the bootloader
 
 [flash]
-slot = "b"
+# slot: the device's
 # a flashed image has no kill switches: it is the owner's to use unplugged
 usb_lost_reboot   = 0
 test_reboot_after = 0

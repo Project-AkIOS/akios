@@ -18,7 +18,7 @@ mkidentity.py took it; the numbers iBoot would take from the factory data (seria
 addresses) are made from the device's name and a hash of the phone's serial number, as xnuloader made them: the
 same at every start, different from phone to phone, and the serial number itself is not in the tree.
 
-  python3 -m tools.ak.adt OUT [--line "boot args"] [--no-ramdisk]      (ak esp calls build())
+  python3 -m tools.ak.adt out/<device>/kernel.adt       (prints a tree; ak esp calls build())
 """
 import os, struct, subprocess, sys
 
@@ -202,19 +202,13 @@ def nvram_image():
     return bytes(image)
 
 
-# ---- the phone (xnuloader's platform_akita: every number from the phone's own device tree) -----------------------
-AKITA = {
-    'name': 'akita',
-    'io_base': 0x10000000, 'io_size': 0x20000000,       # the SoC's peripheral block, chip id through the clock unit
-    'gic_dist': 0x10400000, 'gic_redist': 0x10440000, 'gic_redist_size': 0x200000,
-    'cores': 9, 'core_shift': 8,                        # 0-3 Cortex-A510, 4-7 Cortex-A715, 8 Cortex-X3; MPIDR Aff1
-    'small_cores': 0x0f,
-    'timer_hz': 24576000,                               # the arch timer's clock-frequency (CNTFRQ_EL0 is not set)
-    'boot_core': 0,                                     # the firmware runs on core 0 (DarwinBoot puts the one it
-                                                        # runs on first if not)
-}
-PANIC_LOG = (0xFD3FF000, 0x80000)   # pram: the head of ramoops' console zone (reserved RAM, outside the window)
-WINDOW = 0x180000000                # darwinboot-memory-size: 6 GiB, as xnuloader's MAX_MEM_SIZE
+# ---- the device: [platform] of devices/<name>/device.toml (every number from the phone's own device tree) ---------
+def platform(conf):
+    """the platform numbers build() needs, from a device's merged configuration"""
+    p = dict(conf['platform'])
+    p['name'] = conf['device']['name']
+    p['panic_log'] = tuple(p['panic_log'])
+    return p
 
 
 def word(line, prefix):
@@ -229,7 +223,7 @@ def boot_arg(line, name, default=0):
     return default
 
 
-def build(line, im4p, serial, ramdisk=True, plat=AKITA, window=WINDOW, defaults=''):
+def build(line, im4p, serial, plat, ramdisk=True, defaults=''):
     """kernel.adt for boot line LINE (it decides cores, torch, camera as for xnuloader); DEFAULTS: the kernel's built-in
     arguments (akios.toml [kernel] default_args), for what the line does not name (bt)"""
     ident = identity(im4p)
@@ -277,13 +271,13 @@ def build(line, im4p, serial, ramdisk=True, plat=AKITA, window=WINDOW, defaults=
               'effective-security-mode-ap', 'secure-boot', 'production-cert'):
         chosen.prop(n, u32(1))
     chosen.prop('development-cert', u32(0))
-    chosen.prop('embedded-panic-log-size', u32(PANIC_LOG[1]))
+    chosen.prop('embedded-panic-log-size', u32(plat['panic_log'][1]))
     chosen.prop('kernel-ctrr-to-be-enabled', u32(0))    # xnu-12377 asserts it is there
     chosen.prop('nvram-bank-size', u32(NVRAM_BANK_SIZE))
     chosen.prop('nvram-bank-count', u32(1))
     chosen.prop('nvram-current-bank', u32(0))
     chosen.prop('nvram-proxy-data', nvram_image())
-    chosen.prop('darwinboot-memory-size', u64(window))
+    chosen.prop('darwinboot-memory-size', u64(plat['window']))
     memory_map = chosen.child(Node('memory-map'))
     if ramdisk:
         memory_map.prop('RAMDisk', u64(0, 0))           # DarwinBoot: md0, the root unless rd= says otherwise
@@ -302,7 +296,7 @@ def build(line, im4p, serial, ramdisk=True, plat=AKITA, window=WINDOW, defaults=
 
     root.child(Node('buttons')).prop('home-button-type', u32(2))    # 2: no home button, the home gesture
     root.child(Node('options'))                                     # IOKit's NVRAM node
-    root.child(Node('pram')).prop('reg', u64(*PANIC_LOG))
+    root.child(Node('pram')).prop('reg', u64(*plat['panic_log']))
 
     cores = [plat['boot_core']]
     if more_cores:
@@ -366,16 +360,7 @@ def dump(data, out=sys.stdout):
 
 
 if __name__ == '__main__':
-    import argparse
-    a = argparse.ArgumentParser(description='kernel.adt for DarwinBoot')
-    a.add_argument('out')
-    a.add_argument('--line', default='cpus=9 torch=3')
-    a.add_argument('--im4p', default=os.path.expanduser('~/akita/akios-data/ipsw-d16ap/DeviceTree.d16ap.im4p'))
-    a.add_argument('--serial-file', default=os.path.expanduser('~/akita/usb_serial'))
-    a.add_argument('--no-ramdisk', action='store_true')
-    a.add_argument('--dump', action='store_true')
-    a = a.parse_args()
-    data = build(a.line, a.im4p, open(a.serial_file).readline().strip(), not a.no_ramdisk)
-    open(a.out, 'wb').write(data)
-    if a.dump:
-        dump(data)
+    # (the tree is built by `ak esp`, for the device it works for: out/<device>/kernel.adt; this shows one)
+    if len(sys.argv) != 2:
+        sys.exit('usage: python3 -m tools.ak.adt KERNEL.ADT     (prints the tree)')
+    dump(open(sys.argv[1], 'rb').read())

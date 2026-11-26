@@ -1,0 +1,90 @@
+# devices/akita/device.toml: the Google Pixel 8a (akita, Tensor G3 "zuma"). Everything here is this phone's; what is the
+# same for every device is in ../../akios.toml. ak merges the two (this file wins), so any akios.toml section may be
+# overridden here. devices/README.md says how to add a device.
+
+[device]
+name     = "akita"
+model    = "Google Pixel 8a"
+soc      = "zuma"                      # Google Tensor G3
+vendor   = "Google"                    # the firmware's Platforms/<vendor>, Silicon/<vendor>
+# the phone's own data, never in git: ~/akita/akios-data/devices/akita/ (firmware/fw-*, usb_serial)
+data     = "~/akita/akios-data/devices/akita"
+# the iPhone whose identity Darwin's user space gets (its device tree from the IPSW: [userland] ipsw)
+iphone_tree = "DeviceTree.d16ap.im4p"  # iPhone 13 mini (iPhone14,4)
+
+[kernel]
+# the drivers built in (one build option each); ak writes config/MASTER.hakios and bsd/dev/hakios.drivers.h from this
+drivers  = [
+  "guard", "bt_host", "battery", "ufs", "wifi_station",
+  "akita_aoc", "akita_amp", "akita_bt", "akita_torch", "akita_camera", "akita_display", "akita_gnss", "akita_mali",
+  "akita_haptic", "akita_keys", "akita_touch", "akita_modem", "akita_battery", "akita_acpm", "akita_thermal",
+  "akita_dvfs", "akita_rtc", "akita_power", "akita_mct", "akita_trusty", "akita_usb", "akita_wifi",
+]
+# what the kernel assumes when the boot line does not name an argument (pexpert/arm/pe_bootargs.c)
+default_args = [
+  "touchscreen=1", "buttons=1", "fuelgauge=1", "usbmux=1", "thermal=1", "dvfs=1", "mali_keep=1", "metal=1",
+  "metal_plugin=../../../akita/lib/HakiosMetal", "display_flip=1", "metal_all=1",
+  "root_apfs=ufs_ios_system", "var_hfs=ufs_ios_data", "cryptex_dev=ufs_ios_preboot",
+  "pcie=5", "pcie_delay=10", "wifi=8", "aoc=3", "amp=2", "speaker=1", "amp_gain=17", "aocrec=1", "fb_beat=0",
+  "cpuidle=1", "bt=2",
+]
+
+[phone]
+# the command line every boot gets
+cmdline  = [
+  "debug=0x8", "cpus=9", "ufs=2", "ufs_write=1", "torch=3", "hakios_arm64e=1",
+  "wifi=8", "pcie=5",
+  "ca_metallib=/akita/share/ca-share/QuartzCore-default.metallib",
+  "display_hz=120", "fbwidth=1080", "fbheight=2340", "fbscale=3", "fbsubtype=2340", "fb_zc=1", "anim_max=1",
+  "metal=1", "metal_plugin=../../../akita/lib/HakiosMetal", "metal_all=1", "mali_keep=1", "display_flip=1",
+  "dvfs=1", "thermal=1", "skip_setup=1",
+]
+
+[flash]
+slot = "b"                             # our firmware's boot slot; Android stays on the other
+
+# Darwin's device tree (tools/ak/adt.py): every number from the phone's own (Android's) device tree
+[platform]
+io_base         = 0x10000000           # the SoC's peripheral block, chip id through the clock unit
+io_size         = 0x20000000
+gic_dist        = 0x10400000
+gic_redist      = 0x10440000
+gic_redist_size = 0x200000
+cores           = 9                    # 0-3 Cortex-A510, 4-7 Cortex-A715, 8 Cortex-X3
+core_shift      = 8                    # MPIDR Aff1
+small_cores     = 0x0f
+timer_hz        = 24576000             # the arch timer's clock-frequency (CNTFRQ_EL0 is not set)
+boot_core       = 0                    # the firmware runs on core 0
+panic_log       = [0xFD3FF000, 0x80000]   # pram: the head of ramoops' console zone (reserved RAM, outside the window)
+window          = 0x180000000          # darwinboot-memory-size: the kernel's memory window, 6 GiB
+
+# How the bootloader wants the boot image (tools/ak/bootimg.py; read off the phone's own boot partition 2026-10-31,
+# bootloader akita-16.4-14540574)
+[boot_image]
+header_version = 4
+kernel         = "lz4"                 # LZ4's legacy frame, as the phone's own kernel
+avb_footer     = 0x4000000             # zuma's vbmeta chains boot: an unsigned footer, the boot partition's size
+
+# The firmware (Mu-Silicium + firmware/ of akios): its device package and config
+[firmware]
+package  = "akitaPkg"                  # firmware/Platforms/<vendor>/<package>
+config   = "akita.toml"                # firmware/Resources/Configs/<config>
+kernel   = "akita-kernel"              # what build_uefi.py leaves in Build/<package>/
+
+# The vendor's files the kernel's drivers load (data/firmware/fw-*: never in git): /fw of the RAM disk
+[vendor_files]
+files = [
+  "fw-gpu/mali_csffw-r54p2.bin",
+  "fw-wifi/fw_bcmdhd.bin_4383_a3", "fw-wifi/bcmdhd.cal_4383_a3", "fw-wifi/bcmdhd_clm.blob_4383_a3",
+  "fw-wifi/bcmdhd_txcap.blob_4383_a3", "fw-wifi/BCM.hcd",
+  "fw-haptic/cs40l26*.wmfw", "fw-haptic/cs40l26*.bin",
+  "fw-audio/cs35l41-dsp1-spk-*.wmfw", "fw-audio/cs35l41-dsp1-spk-*.bin", "fw-audio/R-cs35l41-dsp1-spk-*.bin",
+  "fw-aoc/aoc.bin",
+  "fw-camera-akita/camera-akita-*.isp",
+  "fw-modem-akita/nv_normal.bin", "fw-modem-akita/nv_protected.bin", "fw-modem-akita/replay_region.bin",
+  "fw-modem-akita/handover.bin",
+  "fw-gnss/kepler.bin", "fw-gnss/gnss-cfg.bin", "fw-gnss/gnss-start.bin",
+  "fw-sensors/usf-registry.bin",
+]
+# made at build time: the carriers' configuration packed into one file
+carrierconfig = "fw-modem-akita/carrierconfig"

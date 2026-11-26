@@ -6,13 +6,16 @@
   ak fwboot NAME            RAM-boot out/firmware.img, wait for the phone to come back to Android, keep its log
   ak userland [--oslog L,..] build out/akios.apfs, the RAM disk the kernel starts from, out of userland/ (its
                             userland.toml; --oslog: those launchd jobs log to the console)
-  ak loader                 build the UEFI loader from loader/ (out/loader: AkiosBoot.efi, DarwinBoot.efi, Fat.efi)
+  ak loader                 build the UEFI loader from loader/ (out/loader: UniXNU.efi, DarwinBoot.efi, Fat.efi)
   ak esp [--quiet] [--flash] [ARGS]
                             out/esp.img + esp.simg: the ESP our firmware boots from (UniXNU, DarwinBoot, the kernel,
                             its device tree, out/akios.apfs); `fastboot flash esp out/esp.simg` writes it
   ak log [--kernel]         the phone's console log (or kernel log) over the cable
   ak status                 where the phone is: fastboot, Android (adb) or iOS (usbmux)
 
+  ak devices                the devices ak knows (devices/*/device.toml); * the one it works for
+
+ak --device NAME CMD works for another device (or AKIOS_DEVICE=NAME); what it makes goes to out/<device>/.
 Every run's output goes to [paths] logs/<command>-<time>/.
 """
 import argparse, datetime, os, re, struct, subprocess, sys, time
@@ -25,12 +28,52 @@ except ImportError:          # Python < 3.11
     import tomli as tomllib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # tools/ak/ -> the repository
-CONF = tomllib.load(open(os.path.join(ROOT, 'akios.toml'), 'rb'))
+BASE = tomllib.load(open(os.path.join(ROOT, 'akios.toml'), 'rb'))
+
+
+def merged(base, over):
+    """BASE with OVER's keys over it, tables merged key by key (a device's file over akios.toml)"""
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = merged(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def devices():
+    d = os.path.join(ROOT, 'devices')
+    return sorted(n for n in os.listdir(d) if os.path.isfile(os.path.join(d, n, 'device.toml')))
+
+
+def load_device(name):
+    """akios.toml with devices/NAME/device.toml merged over it"""
+    f = os.path.join(ROOT, 'devices', name, 'device.toml')
+    if not os.path.isfile(f):
+        sys.exit('ak: no device %r (devices/: %s)' % (name, ', '.join(devices())))
+    conf = merged(BASE, tomllib.load(open(f, 'rb')))
+    if conf.get('device', {}).get('name') != name:
+        sys.exit('ak: %s says [device] name = %r' % (f, conf.get('device', {}).get('name')))
+    return conf
+
+
+# the device: ak --device NAME, else AKIOS_DEVICE, else akios.toml's device (main() reloads after parsing)
+DEVICE = os.environ.get('AKIOS_DEVICE') or BASE['device']
+CONF = load_device(DEVICE)
 
 
 def path(key):
+    """a [paths] entry; out is the device's own (out/<device>): two devices' builds never mix"""
     p = os.path.expanduser(CONF['paths'][key])
-    return p if os.path.isabs(p) else os.path.join(ROOT, p)
+    p = p if os.path.isabs(p) else os.path.join(ROOT, p)
+    return os.path.join(p, DEVICE) if key == 'out' else p
+
+
+def device_data(*parts):
+    """the device's own data (never in git): [device] data"""
+    return os.path.join(os.path.expanduser(CONF['device']['data']), *parts)
+
+
+def usb_serial():
+    return open(device_data('usb_serial')).readline().strip()
 
 
 
@@ -166,15 +209,16 @@ def cmd_firmware(a):
     venv = os.path.join(ROOT, '.cache', 'mu-venv', 'bin', 'python3')
     if not os.path.exists(os.path.join(mu, 'build_uefi.py')) or not os.path.exists(venv):
         sys.exit('ak: no Mu-Silicium in .cache/mu-silicium (with its submodules) or no .cache/mu-venv')
-    for link, target in (('Platforms/Google', 'Platforms/Google'), ('Silicon/Google', 'Silicon/Google'),
-                         ('Resources/Configs/akita.toml', 'Resources/Configs/akita.toml')):
+    f, vendor = CONF['firmware'], CONF['device']['vendor']
+    for link in ('Platforms/' + vendor, 'Silicon/' + vendor, 'Resources/Configs/' + f['config']):
+        target = link
         dst = os.path.join(mu, link)
         if not os.path.islink(dst):
             os.symlink(os.path.join(fw, target), dst)
     log = os.path.join(rundir('firmware'), 'build.log')
     say('building the firmware (log:', log + ')')
-    sh([venv, 'build_uefi.py', '-d', CONF['phone']['name'], '-r', 'DEBUG'], log=log, cwd=mu)
-    kernel = bytearray(open(os.path.join(mu, 'Build', 'akitaPkg', 'akita-kernel'), 'rb').read())
+    sh([venv, 'build_uefi.py', '-d', DEVICE, '-r', 'DEBUG'], log=log, cwd=mu)
+    kernel = bytearray(open(os.path.join(mu, 'Build', f['package'], f['kernel']), 'rb').read())
     # ABL places an arm64 Image at the start of RAM + text_offset (Linux's rule); BootShim's header has the FD's
     # address there: 0, the size, and flags 0xa (little endian, 4K pages, anywhere). The shim copies the FD itself.
     struct.pack_into('<QQQ', kernel, 8, 0, (len(kernel) + 0xfff) & ~0xfff, 0xa)
@@ -182,7 +226,7 @@ def cmd_firmware(a):
     os.makedirs(out, exist_ok=True)
     open(os.path.join(out, 'firmware-kernel'), 'wb').write(kernel)
     img = os.path.join(out, 'firmware.img')
-    open(img, 'wb').write(bootimg.firmware_image(bytes(kernel)))
+    open(img, 'wb').write(bootimg.firmware_image(bytes(kernel), CONF['boot_image']))
     say('firmware image:', img)
 
 
@@ -235,12 +279,12 @@ def cmd_loader(a):
              PACKAGES_PATH=':'.join([lo, lo + '/DarwinBoot', lo + '/UniXNU', edk2]))
     e['PATH'] = ':'.join([edk2 + '/BaseTools/BinWrappers/PosixLike', edk2 + '/BaseTools/Source/C/bin', e['PATH']])
     say('building the loader (log:', log + ')')
-    sh(['build', '-p', 'AkitaPkg/AkitaPkg.dsc', '-a', 'AARCH64', '-b', 'DEBUG', '-t', 'CLANGPDB', '-n', str(os.cpu_count())],
+    sh(['build', '-p', 'AkiosPkg/AkiosPkg.dsc', '-a', 'AARCH64', '-b', 'DEBUG', '-t', 'CLANGPDB', '-n', str(os.cpu_count())],
        log=log, env=e, cwd=lo)
     out = os.path.join(path('out'), 'loader')
     os.makedirs(out, exist_ok=True)
-    for f in ('AkiosBoot.efi', 'DarwinBoot.efi', 'Fat.efi', 'UniXNU.efi'):
-        sh(['cp', os.path.join(work, 'Build', 'Akita', 'DEBUG_CLANGPDB', 'AARCH64', f), out])
+    for f in ('DarwinBoot.efi', 'Fat.efi', 'UniXNU.efi'):
+        sh(['cp', os.path.join(work, 'Build', 'Akios', 'DEBUG_CLANGPDB', 'AARCH64', f), out])
     say('loader:', out)
 
 
@@ -270,7 +314,9 @@ def esp_ramdisk():
     return new
 
 
-IPHONE_TREE = os.path.join(CONF['userland']['ipsw'].replace('~', os.path.expanduser('~'), 1), 'DeviceTree.d16ap.im4p')   # whose identity Darwin's user space gets
+def iphone_tree():
+    return os.path.join(os.path.expanduser(CONF['userland']['ipsw']), CONF['device']['iphone_tree'])
+
 
 
 def cmd_esp(a):
@@ -286,9 +332,9 @@ def cmd_esp(a):
     # the RAM disk is the root (md0) unless the line names one, as xnuloader had it
     if not adt.word(line, 'rd='):
         line += ' rd=md0'
-    serial = open(os.path.expanduser('~/akita/usb_serial')).readline().strip()
+    serial = usb_serial()
     ramdisk = os.path.expanduser(a.initrd or esp_ramdisk())
-    tree = adt.build(line, IPHONE_TREE, serial, ramdisk=True, defaults=' '.join(CONF['kernel']['default_args']))
+    tree = adt.build(line, iphone_tree(), serial, ramdisk=True, plat=adt.platform(CONF), defaults=' '.join(CONF['kernel']['default_args']))
     open(os.path.join(out, 'kernel.adt'), 'wb').write(tree)
     files = {
         'EFI/BOOT/BOOTAA64.EFI': rd(os.path.join(lo, 'UniXNU.efi')),
@@ -301,7 +347,7 @@ def cmd_esp(a):
     img = os.path.join(out, 'esp.img')
     open(img, 'wb').write(fat.make_fat(files, label='AKIOS ESP', size=ESP_BYTES))
     sh(['img2simg', img, os.path.join(out, 'esp.simg')])
-    say('ESP:', img, '(and esp.simg); `fastboot flash esp out/esp.simg` writes it')
+    say('ESP:', img, '(and esp.simg); `fastboot flash esp %s` writes it' % os.path.join(out, 'esp.simg'))
 
 
 # ---- images -----------------------------------------------------------------------------------------------------------
@@ -312,7 +358,7 @@ def quiet_now():
 
 
 def cmdline(flash, extra, quiet, speaker=False):
-    serial = open(os.path.expanduser('~/akita/usb_serial')).readline().strip()
+    serial = usb_serial()
     k = CONF['flash'] if flash else CONF['test']
     args = list(CONF['phone']['cmdline'])
     args[1:1] = ['usb_lost_reboot=%d' % k['usb_lost_reboot'], 'test_reboot_after=%d' % k['test_reboot_after'],
@@ -367,6 +413,12 @@ def to_bootloader():
     sys.exit('ak: the phone did not reach the bootloader')
 
 
+def cmd_devices(a):
+    for n in devices():
+        d = load_device(n)['device']
+        print('%s%-10s %s (%s)' % ('*' if n == DEVICE else ' ', n, d.get('model', '?'), d.get('soc', '?')))
+
+
 def cmd_status(a):
     say('fastboot' if in_fastboot() else 'iOS (usbmux)' if in_ios() else 'Android (adb)' if in_android() else 'not seen')
     if in_fastboot():
@@ -388,7 +440,9 @@ def cmd_log(a):
 
 def main():
     p = argparse.ArgumentParser(prog='ak', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--device', help='the device (devices/NAME/device.toml; default: AKIOS_DEVICE, else akios.toml\'s)')
     s = p.add_subparsers(dest='cmd', required=True)
+    s.add_parser('devices').set_defaults(f=cmd_devices)
     s.add_parser('kernel').set_defaults(f=cmd_kernel)
     s.add_parser('toolchain').set_defaults(f=cmd_toolchain)
     s.add_parser('loader').set_defaults(f=cmd_loader)
@@ -405,6 +459,9 @@ def main():
     l.set_defaults(f=cmd_log)
     s.add_parser('status').set_defaults(f=cmd_status)
     a = p.parse_args()
+    global DEVICE, CONF
+    if a.device and a.device != DEVICE:
+        DEVICE, CONF = a.device, load_device(a.device)
     a.f(a)
 
 

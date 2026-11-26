@@ -22,6 +22,8 @@ class Build:
         self.repo = ex(u['repo'])
         self.man = tomllib.load(open(os.path.join(self.repo, 'userland.toml'), 'rb'))
         self.vars = {k: ex(v) for k, v in u.items() if isinstance(v, str) and k not in ('arch', 'sdk_target')}
+        # the device's vendor files: its data directory's firmware/ ([device] data), the list in its [vendor_files]
+        self.vars['firmware'] = os.path.join(os.path.expanduser(conf['device']['data']), 'firmware')
         self.arch = u.get('arch', 'arm64e')
         self.work = os.path.join(path('work') if 'work' in conf['paths'] else os.path.join(root, 'work'), 'userland')
         self.out = path('out')
@@ -310,7 +312,7 @@ class Build:
         return lines
 
     def firmware(self):
-        fw = self.man['firmware']
+        fw = self.conf.get('vendor_files', {})
         top = self.vars['firmware']
         n = 0
         os.makedirs(os.path.join(self.img, 'fw'), exist_ok=True)

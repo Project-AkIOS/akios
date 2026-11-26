@@ -1,4 +1,5 @@
-"""The phone's boot image for our firmware: what `ak firmware` writes to out/firmware.img.
+"""The phone's boot image for our firmware: what `ak firmware` writes to out/<device>/firmware.img, in the style
+the device's [boot_image] names. The Pixel 8a's (akita), for example:
 
 Google's bootloader on the Pixel 8a (akita) starts what is in the boot partition (or what `fastboot boot` sends) as an
 arm64 Linux kernel. It wants the image as the phone's own boot partition has it (read off the phone 2026-10-31,
@@ -19,7 +20,6 @@ import subprocess
 import sys
 
 PAGE = 4096
-BOOT_PARTITION = 0x4000000          # fastboot getvar partition-size:boot_a
 
 
 def lz4_legacy(data):
@@ -37,7 +37,7 @@ def boot_image_v4(kernel, ramdisk=b'\0', cmdline=b''):
     return pad(header) + pad(kernel) + pad(ramdisk) + b'\0' * PAGE
 
 
-def avb_hash_footer(image, partition_size=BOOT_PARTITION, partition_name='boot'):
+def avb_hash_footer(image, partition_size, partition_name='boot'):
     """IMAGE with an unsigned AVB hash footer, PARTITION_SIZE bytes long: what avbtool add_hash_footer --algorithm NONE
     makes (libavb's avb_footer.h, avb_vbmeta_image.h, avb_hash_descriptor.h; big-endian): the image padded to 4 KiB,
     the vbmeta image (a 256-byte header, no authentication block, an auxiliary block with one hash descriptor), zeros,
@@ -69,8 +69,15 @@ def avb_hash_footer(image, partition_size=BOOT_PARTITION, partition_name='boot')
     return image + b'\0' * (vbmeta_offset - len(image)) + vbmeta + b'\0' * (partition_size - 64 - end) + footer
 
 
-def firmware_image(kernel):
-    """out/firmware.img from the firmware's arm64 Image (BootShim + the FD)"""
+def firmware_image(kernel, style):
+    """out/<device>/firmware.img from the firmware's arm64 Image (BootShim + the FD), as the device's [boot_image]
+    says: header_version (4 only, so far), kernel ("lz4" or "raw"), avb_footer (the boot partition's size; 0: none)"""
     if kernel[0x38:0x3c] != b'ARM\x64':
         sys.exit('ak: the firmware has no arm64 Image header')
-    return avb_hash_footer(boot_image_v4(lz4_legacy(kernel)))
+    if style.get('header_version', 4) != 4:
+        sys.exit('ak: boot image header version %s: only 4 is made here so far' % style.get('header_version'))
+    k = {'lz4': lz4_legacy, 'raw': bytes}.get(style.get('kernel', 'raw'))
+    if k is None:
+        sys.exit('ak: [boot_image] kernel = %r: "lz4" or "raw"' % style.get('kernel'))
+    img = boot_image_v4(k(kernel))
+    return avb_hash_footer(img, style['avb_footer']) if style.get('avb_footer') else img

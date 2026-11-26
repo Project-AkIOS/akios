@@ -1,0 +1,47 @@
+# devices/<codename>/device.toml: copy this there (as device.toml) and fill it in; ../README.md says where each value
+# comes from. Any akios.toml section can be overridden here; these are the ones every device must have.
+
+[device]
+name        = "<codename>"             # as fastboot and the firmware call it
+model       = "Google Pixel <n>"
+soc         = "<soc>"                  # zuma, gs201, gs101, ...
+vendor      = "Google"                 # the firmware's Platforms/<vendor>, Silicon/<vendor>
+data        = "~/akita/akios-data/devices/<codename>"   # usb_serial, firmware/fw-* (never in git)
+iphone_tree = "DeviceTree.d16ap.im4p"  # the iPhone whose identity iOS gets (from the IPSW)
+
+[kernel]
+drivers      = ["guard", "bt_host", "battery", "ufs", "wifi_station"]   # + the phone's (or its SoC's) drivers
+default_args = []
+
+[phone]
+cmdline = ["debug=0x8", "cpus=<cores>", "fbwidth=<w>", "fbheight=<h>", "fbscale=3", "display_hz=<hz>"]
+
+[flash]
+slot = "b"
+
+[platform]
+io_base         = 0x0
+io_size         = 0x0
+gic_dist        = 0x0
+gic_redist      = 0x0
+gic_redist_size = 0x0
+cores           = 8
+core_shift      = 8
+small_cores     = 0x0f
+timer_hz        = 24576000
+boot_core       = 0
+panic_log       = [0x0, 0x80000]
+window          = 0x180000000
+
+[boot_image]
+header_version = 4
+kernel         = "lz4"
+avb_footer     = 0x4000000
+
+[firmware]
+package = "<codename>Pkg"
+config  = "<codename>.toml"
+kernel  = "<codename>-kernel"
+
+[vendor_files]
+files = []
