@@ -131,6 +131,10 @@ def identity(im4p):
         'haptics': kept(product['haptics'][0], own),
         'camera': kept(product['camera'][0], own),
         'audio': kept(product['audio'][0], own) if 'audio' in product else [],
+        # (11-26) arm-io/wlan: the radio's settings wifid reads (wlan.*, bcom.*); its address is ours. launchd starts
+        # wifid only on a device tree with a node of this name (its job's _LimitLoadToDeviceTree)
+        'wlan': kept(next(c for c in children['arm-io'][1] if name_of(c) == 'wlan')[0],
+                     own + ('local-mac-address', 'audio-protection-driver')),
     }
 
 
@@ -312,6 +316,9 @@ def build(line, im4p, serial, ramdisk=True, plat=AKITA, window=WINDOW):
     if camera:
         isp = arm_io.child(Node('isp'))
         isp.prop('camera-rear', u32(1)).prop('camera-front', u32(1))
+    wlan = arm_io.child(Node('wlan'))
+    from_iphone(wlan, ident['wlan'])
+    wlan.prop('local-mac-address', ids['wifi'])
     gic = arm_io.child(Node('gic'))
     gic.prop('device_type', cstr('interrupt-controller'))
     gic.prop('compatible', cstr('arm,gic-v3'))

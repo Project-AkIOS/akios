@@ -59,7 +59,7 @@ name     = "akita"
 # the command line every boot gets (the loader adds the device's own: devices/akita/soc.args)
 cmdline  = [
   "debug=0x8", "cpus=9", "ufs=2", "ufs_write=1", "torch=3", "hakios_arm64e=1",
-  "wifi=0", "pcie=0",
+  "wifi=8", "pcie=5",
   "ca_metallib=/akita/share/ca-share/QuartzCore-default.metallib",
   "display_hz=120", "fbwidth=1080", "fbheight=2340", "fbscale=3", "fbsubtype=2340", "fb_zc=1", "anim_max=1",
   "metal=1", "metal_plugin=../../../akita/lib/HakiosMetal", "metal_all=1", "mali_keep=1", "display_flip=1",
