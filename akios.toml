@@ -42,9 +42,9 @@ ca_share     = "~/ca-share"                                  # QuartzCore's defa
 # (transition) still in the old tree: Metal (its own repository later) and the APFS tools
 metal        = "~/akita/hakios-base/hakios-metal"
 metal_plugin = "~/akita/hakios-base/userland/src"           # HakiosMetalCA.m, HakiosMetal.plist
-mkapfs       = "~/akita/hakios-base/tools/apfs/mkapfs.py"
-apfs_reader  = "~/akita/hakios-base/tools/apfs/apfs.py"
-carrierpack  = "~/akita/hakios-base/devices/akita/tools/mkcarrierpack.py"
+mkapfs       = "tools/apfs/mkapfs.py"
+apfs_reader  = "tools/apfs/apfs.py"
+carrierpack  = "tools/mkcarrierpack.py"
 
 [iogpu]
 # tools/iogpu (GPU research, read-only on these): the reference inputs it reads by default. Not needed to build.
