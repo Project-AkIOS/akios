@@ -63,7 +63,7 @@ cmdline  = [
   "ca_metallib=/akita/share/ca-share/QuartzCore-default.metallib",
   "display_hz=120", "fbwidth=1080", "fbheight=2340", "fbscale=3", "fbsubtype=2340", "fb_zc=1", "anim_max=1",
   "metal=1", "metal_plugin=../../../akita/lib/HakiosMetal", "metal_all=1", "mali_keep=1", "display_flip=1",
-  "dvfs=1", "thermal=1",
+  "dvfs=1", "thermal=1", "skip_setup=1",
 ]
 # the boot line is cut at about 1000 characters: past this, ak refuses to build an image
 cmdline_max = 900
