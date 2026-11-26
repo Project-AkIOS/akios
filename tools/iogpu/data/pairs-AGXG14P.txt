@@ -1,0 +1,22 @@
+# kc-vtables --pairs: each AGXG14P (iPhone14,4, 24B156) class and the IOGPUFamily base class it derives from.
+# Taken from kc-classes super chains; the AGX classes have no macOS twin, their bases do.
+# vendor class            IOGPU base
+AGXAcceleratorG14P        IOGPU
+AGXShared                 IOGPUDevice
+AGXDeviceUserClient       IOGPUDeviceUserClient
+AGXCommandQueue           IOGPUCommandQueue
+AGXResource               IOGPUResource
+AGXAllocation             IOGPUSysMemory
+AGXGartG14                IOGPUTask
+AGXSecureMemoryMap        IOGPUMemoryMap
+AGXEventMachine           IOGPUEventMachine
+AGX3DChannelG14           IOGPUChannel
+AGXWorkQueue              IOGPUWorkQueue
+AGXScheduler              IOGPUScheduler
+AGXVirtualMemory          IOGPUVirtualMemory
+AGXStatistics             IOGPUStatistics
+AGX3DCommandDescriptor    IOGPUCommandDescriptor
+AGXAllocationList2        IOGPUSegmentResourceList
+AGXBlockFence             IOGPUBlockFence
+AGXDebugBufferShmem       IOGPUDeviceShmem
+AGXParameterMemoryVirtual IOGPUMemory

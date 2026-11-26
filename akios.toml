@@ -46,6 +46,14 @@ mkapfs       = "~/akita/hakios-base/tools/apfs/mkapfs.py"
 apfs_reader  = "~/akita/hakios-base/tools/apfs/apfs.py"
 carrierpack  = "~/akita/hakios-base/devices/akita/tools/mkcarrierpack.py"
 
+[iogpu]
+# tools/iogpu (GPU research, read-only on these): the reference inputs it reads by default. Not needed to build.
+kernelcache = "~/akita/ref/kc-24B156/kernelcache.macho"   # iOS 24B156 kernelcache, decompressed; KC.symbols.json beside it names kernel symbols
+kdk         = "~/akita/ref/kdk-26B131"                    # macOS KDK 26B131: pkg/KDK.pkg/Payload (iogpu kdk extract)
+mac_kexts   = "~/akita/ref/iogpu-research"                # thin arm64e macOS kexts, mac-NAME.arm64e (what iogpu kdk extract makes)
+symbols     = "~/akita/ref/symbols-24B156"                # iOS 24B156 Symbols supplement (the directory holding System/, or one above)
+symbols_db  = "~/akita/ref/symbols-24B156.sqlite"         # its symbol database: syms(addr, name, ...), images(path, ...)
+
 [phone]
 name     = "akita"
 # the command line every boot gets (the loader adds the device's own: devices/akita/soc.args)
