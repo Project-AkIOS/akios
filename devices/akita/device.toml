@@ -32,7 +32,7 @@ default_args = [
 [phone]
 # the command line every boot gets
 cmdline  = [
-  "debug=0x8", "cpus=9", "ufs=2", "ufs_write=1", "torch=3", "hakios_arm64e=1",
+  "debug=0x8", "msgbuf=1048576", "cpus=9", "ufs=2", "ufs_write=1", "torch=3", "hakios_arm64e=1",
   "wifi=8", "pcie=5",
   "ca_metallib=/akita/share/ca-share/QuartzCore-default.metallib",
   "display_hz=120", "fbwidth=1080", "fbheight=2340", "fbscale=3", "fbsubtype=2340", "fb_zc=1", "anim_max=1",
