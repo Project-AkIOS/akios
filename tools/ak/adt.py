@@ -339,6 +339,13 @@ def build(line, im4p, serial, plat, ramdisk=True, defaults=''):
         from_iphone(bluetooth, ident['bluetooth'])
         bluetooth.prop('transport-encoding', u32(3))
         bluetooth.prop('local-mac-address', ids['bluetooth'])     # = /chosen/mac-address-bluetooth0
+    # (11-27) arm-io/smc and its iop-smc-nub: where an iPhone's SMC (a coprocessor) is, and AppleSMC on the nub, which
+    # libSMC opens (IOServiceMatching "AppleSMC") for the system's keys. Only the names: the iPhone's registers,
+    # interrupts and RTBuddy endpoints are not this phone's; the kernel's AppleSMC (iokit/Kernel/AppleSMC.cpp) serves
+    # the keys from its drivers
+    smc = arm_io.child(Node('smc'))
+    smc.prop('device_type', cstr('smc')).prop('role', cstr('SMC'))
+    smc.child(Node('iop-smc-nub')).prop('compatible', cstr('iop-nub,rtbuddy-v2'))
     gic = arm_io.child(Node('gic'))
     gic.prop('device_type', cstr('interrupt-controller'))
     gic.prop('compatible', cstr('arm,gic-v3'))
