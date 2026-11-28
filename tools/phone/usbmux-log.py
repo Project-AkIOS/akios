@@ -5,6 +5,9 @@ what is added, until this stops.
 
 usage: usbmux-log.py [-k] [OUTPUT]      (stdout, or OUTPUT as well; needs usbmuxd running, and access to its socket)
        -k: the kernel message buffer (port 5: printf and IOLog, which without -v are not on the console)
+       --pstore: the persistent console (port 11, 11-28): up to 2 MiB of the console kept across restarts, oldest
+                 first, earlier boots included ("=== AkIOS kernel console ===" starts each) -- the end of a boot
+                 that restarted by itself; ends by itself
 """
 import plistlib
 import socket
@@ -37,8 +40,8 @@ def mux_connect(port):
 
 
 args = sys.argv[1:]
-port = 5 if args[:1] == ['-k'] else 1
-args = args[1:] if port == 5 else args
+port = {'-k': 5, '--pstore': 11}.get(args[0], 1) if args else 1
+args = args[1:] if port != 1 else args
 out = open(args[0], 'ab') if args else None
 s = mux_connect(port)
 try:
